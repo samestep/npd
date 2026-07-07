@@ -16,12 +16,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Existence {
-    /// Attr path not present in this revision.
+    /// Attr path not present in this revision (determined at diff time by set
+    /// membership — `nix-eval-jobs` simply doesn't emit a line for it).
     Absent,
-    /// Present but meta.broken / badPlatforms / unsupported / insecure.
+    /// Present but meta.broken / badPlatforms / unsupported / insecure. We still
+    /// get a `drv_path` (npd evaluates with the allow-flags on), so it can be
+    /// built via a bypass; it's just marked not-to-build.
     Blocked,
     /// Present and eligible to build on this platform.
     Buildable,
+    /// Present but evaluation itself errored (no drv) — e.g. an assertion or IFD
+    /// failure that survives the allow-flags. Distinct from a *build* failure.
+    Error,
 }
 
 /// Result of evaluating one attribute on one platform at one commit.
@@ -39,9 +45,14 @@ pub struct AttrEval {
     pub broken: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsupported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insecure: Option<bool>,
     /// Per meta.hydraPlatforms for this system — whether Hydra is *expected* to build it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hydra_platforms_ok: Option<bool>,
+    /// The evaluation error message, when `existence` is `Error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Where a build observation came from. Local builds, Hydra job records, and
