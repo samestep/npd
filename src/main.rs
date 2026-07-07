@@ -426,11 +426,13 @@ fn cmd_build(
     // build_targets streams per-target progress; we just tally the summary.
     let built = build::build_targets(&targets, policy, dry_run)?;
 
-    let (mut ok, mut failed, mut would, mut skip_ok, mut skip_fail) = (0, 0, 0, 0, 0);
+    let (mut ok, mut failed, mut dep_failed, mut would, mut skip_ok, mut skip_fail) =
+        (0, 0, 0, 0, 0, 0);
     for r in &built {
         match (r.decision, r.outcome) {
             (Decision::Build, Some(Outcome::Built)) => ok += 1,
             (Decision::Build, Some(Outcome::Failed)) => failed += 1,
+            (Decision::Build, Some(Outcome::DepFailed)) => dep_failed += 1,
             (Decision::Build, None) => would += 1,
             (Decision::SkipOk, _) => skip_ok += 1,
             (Decision::SkipFail, _) => skip_fail += 1,
@@ -440,9 +442,12 @@ fn cmd_build(
     if dry_run {
         println!("would-build={would} skipped-ok={skip_ok} skipped-fail={skip_fail} ({} targets)", built.len());
     } else {
-        println!("built={ok} failed={failed} skipped-ok={skip_ok} skipped-fail={skip_fail}");
-        if failed > 0 {
-            bail!("{failed} build(s) failed");
+        println!(
+            "built={ok} failed={failed} dep-failed={dep_failed} \
+             skipped-ok={skip_ok} skipped-fail={skip_fail}"
+        );
+        if failed + dep_failed > 0 {
+            bail!("{failed} failed, {dep_failed} dep-failed");
         }
     }
     Ok(())
