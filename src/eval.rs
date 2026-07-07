@@ -8,7 +8,7 @@
 //! the whole, meta-heavy output).
 
 use std::fs::{self, File};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -166,7 +166,22 @@ fn run_eval(
         .spawn()
         .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
-    let attrs = parse_jobs(BufReader::new(stdout))?;
+
+    // A full-set eval takes minutes; stream a live attr counter so it never
+    // looks hung. Progress goes to stderr (stdout stays clean for piping).
+    let short: String = commit.chars().take(12).collect();
+    eprint!("  evaluating {short} ({system})…");
+    let _ = std::io::stderr().flush();
+    let mut attrs = Vec::new();
+    for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
+        attrs.push(raw_to_attr_eval(item.context("parsing nix-eval-jobs output")?));
+        if attrs.len() % 2000 == 0 {
+            eprint!("\r  evaluating {short} ({system})… {} attrs", attrs.len());
+            let _ = std::io::stderr().flush();
+        }
+    }
+    eprintln!("\r  evaluated {short} ({system}): {} attrs          ", attrs.len());
+
     let status = child.wait().context("waiting for nix-eval-jobs")?;
     // nix-eval-jobs exits non-zero if *any* attr errored but still emits the
     // rest, so a non-zero status with parsed attrs is normal (a full nixpkgs
@@ -227,6 +242,8 @@ pub fn eval_commit(
         if scope.is_empty()
             && let Some(attrs) = store.load_eval(commit, system, profile, EVAL_VERSION)?
         {
+            let short: String = commit.chars().take(12).collect();
+            eprintln!("  using cached eval: {short} ({system})");
             results.push(Eval {
                 system: system.clone(),
                 attrs,
