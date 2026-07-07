@@ -11,6 +11,7 @@
 mod build;
 mod diff;
 mod eval;
+mod hydra;
 mod model;
 mod store;
 
@@ -99,7 +100,21 @@ enum Command {
         prefer_local: bool,
     },
     /// Fetch facts from Hydra on demand and record them as observations.
-    Hydra { attrs: Vec<String> },
+    Hydra {
+        /// Git commit / revision to evaluate the attrs at.
+        commit: String,
+        /// Attribute paths to look up (dotted). Required.
+        attrs: Vec<String>,
+        /// nixpkgs repo to resolve the commit in (default: `$NPD_NIXPKGS`).
+        #[arg(long)]
+        nixpkgs: Option<PathBuf>,
+        /// Systems to look up (repeatable); defaults to the host system.
+        #[arg(long)]
+        system: Vec<String>,
+        /// Hydra jobset for the forward lookup (default: `nixpkgs/trunk`).
+        #[arg(long)]
+        jobset: Option<String>,
+    },
     /// Render a Markdown report from stored facts.
     Report,
 }
@@ -411,6 +426,48 @@ fn cmd_build(
     Ok(())
 }
 
+fn cmd_hydra(
+    commit: String,
+    attrs: Vec<String>,
+    nixpkgs: Option<PathBuf>,
+    system: Vec<String>,
+    jobset: Option<String>,
+) -> Result<()> {
+    if attrs.is_empty() {
+        bail!("npd hydra: pass one or more attrs to look up");
+    }
+    let repo = resolve_repo(nixpkgs)?;
+    let systems = resolve_systems(system);
+    let jobset = jobset.unwrap_or_else(|| hydra::DEFAULT_JOBSET.to_string());
+    let mut store = store::Store::open(&eval::db_path()?)?;
+
+    let evals = eval::eval_commit(&repo, &commit, &systems, eval::DEFAULT_PROFILE, &attrs)?;
+    let now = chrono::Utc::now().timestamp();
+    let mut recorded = 0;
+    for e in &evals {
+        for a in &e.attrs {
+            let Some(drv) = &a.drv_path else {
+                println!("  {} {}: no drv (eval error)", e.system, a.attr);
+                continue;
+            };
+            let r = hydra::observe(&a.attr, drv, &e.system, &jobset, now);
+            for o in &r.observations {
+                store.add_observation(o)?;
+                recorded += 1;
+            }
+            println!(
+                "  {} {}: cache={} job={}",
+                e.system,
+                a.attr,
+                if r.in_cache { "hit" } else { "miss" },
+                r.job.as_deref().unwrap_or("none"),
+            );
+        }
+    }
+    println!("recorded {recorded} observation(s)");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Eval {
@@ -450,7 +507,13 @@ fn main() -> Result<()> {
             retry,
             prefer_local,
         ),
-        Command::Hydra { .. } => bail!("npd hydra: not implemented yet (see DESIGN.md build order)"),
+        Command::Hydra {
+            commit,
+            attrs,
+            nixpkgs,
+            system,
+            jobset,
+        } => cmd_hydra(commit, attrs, nixpkgs, system, jobset),
         Command::Report => bail!("npd report: not implemented yet (see DESIGN.md build order)"),
     }
 }
