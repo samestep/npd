@@ -202,13 +202,20 @@ root.
 
 ## 9. Build order (spine first; resist features until the spine carries weight)
 
-1. cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`).
-2. two-way diff, then the three-way (merge-base) diff.
-3. the drvpath-keyed observation store + `BuildPolicy` + a local build driver
+The spine is implemented (✓); what remains are refinements.
+
+1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`).
+2. ✓ two-way diff, then the three-way (merge-base) diff.
+3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it and manages gcroots.
-4. Markdown report reusing the classifier.
-5. *then* Hydra facts (narinfo → job → drift), richer reports, remote-builder
-   fan-out.
+4. ✓ Hydra facts (narinfo → forward job → drift), recorded as observations.
+5. ✓ Markdown report classifying the changed set from the observation log.
+
+Open refinements: `substitutable` build pre-skip (batch validity/narinfo so we
+don't invoke `nix build` on already-available drvs); `DepFailed`/cascade
+detection (the 0-byte-log signal) so a dependency failure isn't counted as a
+direct one; `Local`-vs-`Cache` build fidelity (a dry-run probe to tell a
+from-source build from a substitution); parallel builds; remote-builder fan-out.
 
 ## 10. Open questions
 

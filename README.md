@@ -24,10 +24,21 @@ So `npd` is a thin **fact store + policy layer over `nix-eval-jobs` and
 
 ## Status
 
-Early scaffolding (Rust; edition 2024, à la [`npc`](https://github.com/samestep/npc)).
-The pure data model (`src/model.rs`) is in place with tests; the orchestration
-(eval / diff / build / hydra / report) is stubbed and being fleshed out
-spine-first — see the build order in `DESIGN.md`.
+Rust (edition 2024, à la [`npc`](https://github.com/samestep/npc)). The spine is
+implemented end-to-end:
+
+- `npd eval <commit>` — cached attr→drv map (SQLite; streamed `nix-eval-jobs`).
+- `npd diff <base> <head> [--three-way]` — changed/added/removed, with merge-base
+  attribution.
+- `npd build <commit> <attrs…>` / `--changed <base>` — observation-backed build
+  driver (remembers successes *and failures*), gc-roots outputs, `--dry-run`.
+- `npd hydra <commit> <attrs…>` — records `Cache` (narinfo, drv-precise) and
+  `HydraJob` (forward, drift-checked) observations.
+- `npd report <base> <head>` — classifies the changed set (regression / fixed /
+  pre-existing / dropped / …) from the observation log.
+
+Refinements still open: `substitutable` build pre-skip, `DepFailed`/cascade
+detection, parallel builds. See `DESIGN.md`.
 
 ## Development
 
