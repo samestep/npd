@@ -8,12 +8,13 @@
 //! the whole, meta-heavy output).
 
 use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use indicatif::ProgressBar;
 use serde::Deserialize;
 
 use crate::model::{AttrEval, Existence};
@@ -170,22 +171,19 @@ fn run_eval(
 
     // A full-set eval takes minutes; stream a live attr counter so it never
     // looks hung. Progress goes to stderr (stdout stays clean for piping).
+    // A full-set eval takes minutes; a spinner keeps it visibly alive. Like npc,
+    // set_message per attr is cheap — the steady tick repaints (to stderr) every
+    // 100ms, so this both throttles redraws and shows the true running count.
     let short: String = commit.chars().take(12).collect();
-    eprint!("  evaluating {short} ({system})…");
-    let _ = std::io::stderr().flush();
+    let spinner = ProgressBar::new_spinner();
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    spinner.set_message(format!("evaluating {short} ({system})…"));
     let mut attrs = Vec::new();
-    // Redraw on a timer (not every N attrs) so the counter moves smoothly at any
-    // eval speed and shows the true running count, while capping stderr writes.
-    let mut last_draw = Instant::now();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>() {
         attrs.push(raw_to_attr_eval(item.context("parsing nix-eval-jobs output")?));
-        if last_draw.elapsed() >= Duration::from_millis(100) {
-            eprint!("\r  evaluating {short} ({system})… {} attrs", attrs.len());
-            let _ = std::io::stderr().flush();
-            last_draw = Instant::now();
-        }
+        spinner.set_message(format!("evaluating {short} ({system})… {} attrs", attrs.len()));
     }
-    eprintln!("\r  evaluated {short} ({system}): {} attrs          ", attrs.len());
+    spinner.finish_with_message(format!("evaluated {short} ({system}): {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
     // nix-eval-jobs exits non-zero if *any* attr errored but still emits the
