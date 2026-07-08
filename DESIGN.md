@@ -84,12 +84,14 @@ again, Nix rebuilds or substitutes it.
 The two fact kinds have opposite access patterns, so they get different backends.
 
 **Evals → one flat file per `(commit, system, profile)`** under `evals/`, sorted
-`attr\tdrv` lines (empty drv = no derivation; `src/eval.rs`). An eval is bulk,
+`attr\tdrv` lines (empty drv = no derivation; `src/eval.rs`). The drv is stored
+stripped of its constant `/nix/store/…​.drv` prefix/suffix, and the whole file is
+zstd-compressed (default level) — together ~3× smaller (~11 MB → ~3.4 MB). An eval is bulk,
 write-once, read-as-a-whole data whose *only* use is to be diffed against another
 eval, so a file beats SQLite on every axis that matters here:
 
-- **smaller** — ~11 MB vs ~22 MB in SQLite (no per-row overhead, no `(run_id,
-  attr)` index duplicating the data);
+- **smaller** — ~3.4 MB compressed (vs ~11 MB raw, ~22 MB in SQLite: no per-row
+  overhead, no `(run_id, attr)` index duplicating the data);
 - **faster to diff** — both files are sorted by attr, so the changed set is a
   linear two-pointer merge over borrowed slices (~16 ms) rather than ~114k
   primary-key point-lookups (~94 ms). The cross-cutting SQL queries that would
@@ -111,7 +113,7 @@ else lives in it. Build logs are stored nowhere: Nix keeps them under
 ```
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log (tiny)
-  evals/<commit>-<sys>-<profile>-v<n>.tsv   # attr→drv maps, one file per eval
+  evals/<commit>-<sys>-<profile>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
   logs/eval-<commit>-<sys>.log  # nix-eval-jobs stderr (tracebacks), per eval
 ```
 

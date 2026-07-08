@@ -25,7 +25,8 @@ use crate::model::{AttrEval, Existence};
 /// a way that could alter the stored attr->drv map; cache entries under a
 /// different version are ignored (and regenerated), never parsed by newer code.
 /// v2: drv paths stored stripped of the `/nix/store/` prefix and `.drv` suffix.
-pub const EVAL_VERSION: u32 = 2;
+/// v3: the (stripped) TSV is zstd-compressed on disk.
+pub const EVAL_VERSION: u32 = 3;
 
 /// The default (and, for now, only) eval profile. npd owns the config so the key
 /// stays a short enumerable label rather than arbitrary Nix (DESIGN.md §6). The
@@ -390,17 +391,22 @@ pub fn db_path() -> Result<PathBuf> {
 // one concat per changed row, so it costs nothing on the unchanged majority the
 // merge skips. The format is strict — every drv is a `/nix/store` `.drv` or
 // absent, matching the rest of npd (e.g. `cache::store_hash`) — with no fallback
-// for other shapes: changing it is an EVAL_VERSION bump, so pre-v2 files are
+// for other shapes: changing it is an EVAL_VERSION bump, so old files are
 // ignored and regenerated, never mis-parsed as if they were stripped.
+//
+// The whole (stripped) TSV is then zstd-compressed on disk (~3x smaller; a full
+// study weighed the level and alternatives — a two-file split, higher levels —
+// and landed on the default). We diff by reading a file whole and decompressing
+// it, so a single stream is the right shape; the merge is unchanged.
 
 fn eval_path(commit: &str, system: &str, profile: &str) -> Result<PathBuf> {
     Ok(cache_root()?
         .join("evals")
-        .join(format!("{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv")))
+        .join(format!("{commit}-{system}-{profile}-v{EVAL_VERSION}.tsv.zst")))
 }
 
-/// Write an eval to its file, sorted by attr, atomically (temp + rename) so a
-/// crash can never leave a truncated file that would poison the cache.
+/// Write an eval to its file, sorted by attr, zstd-compressed, atomically (temp +
+/// rename) so a crash can never leave a truncated file that would poison the cache.
 fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
     let mut rows: Vec<(&str, &str)> = attrs
         .iter()
@@ -414,11 +420,22 @@ fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
         buf.push_str(drv);
         buf.push('\n');
     }
+    // Level 0 = zstd's default level (currently 3); pass the sentinel rather than
+    // a number so we track the library's default rather than pinning it.
+    let compressed = zstd::encode_all(buf.as_bytes(), 0).context("compressing eval")?;
     fs::create_dir_all(path.parent().unwrap()).context("creating evals dir")?;
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &buf).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::write(&tmp, &compressed).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).context("renaming eval into place")?;
     Ok(())
+}
+
+/// Read and decompress an eval file into its TSV text.
+fn read_eval(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let tsv = zstd::decode_all(&bytes[..])
+        .with_context(|| format!("decompressing {}", path.display()))?;
+    String::from_utf8(tsv).with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
 /// The on-disk form of a drv path: strip the constant `/nix/store/` prefix and
@@ -462,8 +479,8 @@ pub type ChangedDrv = (String, Option<String>, Option<String>);
 pub fn changed_set(base: &str, head: &str, system: &str, profile: &str) -> Result<Vec<ChangedDrv>> {
     let bp = eval_path(base, system, profile)?;
     let hp = eval_path(head, system, profile)?;
-    let bbuf = fs::read_to_string(&bp).with_context(|| format!("reading {}", bp.display()))?;
-    let hbuf = fs::read_to_string(&hp).with_context(|| format!("reading {}", hp.display()))?;
+    let bbuf = read_eval(&bp)?;
+    let hbuf = read_eval(&hp)?;
     let b = parse_eval(&bbuf);
     let h = parse_eval(&hbuf);
 
@@ -652,8 +669,9 @@ mod tests {
         write_eval(&path, &attrs).unwrap();
 
         // On disk the drv is stripped; a no-derivation attr is an empty field
-        // (sorted by attr: bad, hello).
-        let raw = fs::read_to_string(&path).unwrap();
+        // (sorted by attr: bad, hello). The file is zstd-compressed, so read it
+        // back through the same helper the diff uses.
+        let raw = read_eval(&path).unwrap();
         assert_eq!(raw, "bad\t\nhello\ta-hello\n");
 
         // Parsing + restoring recovers the original drv paths exactly.
