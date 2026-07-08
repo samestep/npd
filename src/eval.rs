@@ -7,8 +7,9 @@
 //! parsed by streaming NDJSON straight off the child's stdout (never buffering
 //! the whole, meta-heavy output).
 
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::collections::VecDeque;
+use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
@@ -139,16 +140,13 @@ fn run_eval_pb(
     pb: &ProgressBar,
 ) -> Result<Vec<AttrEval>> {
     let expr = build_expr(repo, commit, system, profile)?;
-    // Send stderr to a log file rather than inheriting it: nix-eval-jobs prints a
-    // full Nix traceback per errored attr (megabytes over a whole package set),
-    // and the actionable per-attr error is already in the stdout JSON. A file
-    // (unlike an undrained pipe) also can't deadlock while we stream stdout.
-    // One log per (commit, system) so concurrent evals don't clobber each other.
+    // nix-eval-jobs prints a full Nix traceback per errored attr (megabytes over a
+    // whole package set), and the actionable per-attr error is already in the
+    // stdout JSON — so we neither inherit its stderr (terminal spam) nor persist
+    // it to disk. A thread drains stderr into a bounded ring buffer, keeping only
+    // the last few lines for the fatal-error diagnostic below; draining it (vs. an
+    // undrained pipe) also can't deadlock while we stream stdout.
     let short: String = commit.chars().take(12).collect();
-    let log_dir = cache_root()?.join("logs");
-    fs::create_dir_all(&log_dir).context("creating log dir")?;
-    let log_path = log_dir.join(format!("eval-{short}-{system}.log"));
-    let log = File::create(&log_path).context("creating eval log")?;
 
     let mut child = Command::new("nix-eval-jobs")
         .args([
@@ -161,10 +159,22 @@ fn run_eval_pb(
             &expr,
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(log))
+        .stderr(Stdio::piped())
         .spawn()
         .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let stderr_tail = thread::spawn(move || {
+        const KEEP: usize = 20;
+        let mut ring: VecDeque<String> = VecDeque::with_capacity(KEEP + 1);
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if ring.len() == KEEP {
+                ring.pop_front();
+            }
+            ring.push_back(line);
+        }
+        ring.into_iter().collect::<Vec<_>>().join("\n")
+    });
 
     // A full-set eval takes minutes (and is pathologically slow on macOS — see
     // DESIGN); show a live elapsed timer next to the attr counter (like `nom`'s
@@ -185,6 +195,7 @@ fn run_eval_pb(
     pb.finish_with_message(format!("evaluated {short} ({system}) — {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
+    let stderr_tail = stderr_tail.join().unwrap_or_default();
     // Integrity gate. Per-attr eval errors are emitted *in band* as JSON
     // (`{"attr":…,"error":…}`) and do NOT affect the exit code — a complete
     // full-set eval exits 0 even with thousands of `throw`n attrs. A non-zero
@@ -199,10 +210,9 @@ fn run_eval_pb(
              {status} after streaming {} attr(s), so the result is truncated and \
              will NOT be cached. A worker most likely died — commonly out-of-memory: \
              reduce the worker count or --max-memory-size so their caps fit in RAM. \
-             Last stderr from {}:\n{}",
+             Last stderr:\n{}",
             attrs.len(),
-            log_path.display(),
-            tail(&log_path, 20),
+            stderr_tail,
         );
     }
     Ok(attrs)
@@ -349,17 +359,6 @@ impl Semaphore {
     fn release(&self) {
         *self.m.lock().unwrap() += 1;
         self.cv.notify_one();
-    }
-}
-
-/// The last `lines` lines of a (possibly large) file; empty if unreadable.
-fn tail(path: &Path, lines: usize) -> String {
-    match fs::read_to_string(path) {
-        Ok(s) => {
-            let all: Vec<&str> = s.lines().collect();
-            all[all.len().saturating_sub(lines)..].join("\n")
-        }
-        Err(_) => String::new(),
     }
 }
 
@@ -688,18 +687,6 @@ mod tests {
         let full = build_expr(repo, "abc123", "aarch64-linux", "default").unwrap();
         assert!(full.contains(r#"builtins.fetchGit { url = "/repo"; rev = "abc123"; }"#));
         assert!(full.contains("allowBroken = true"));
-    }
-
-    #[test]
-    fn tail_returns_last_lines() {
-        let dir = std::env::temp_dir().join(format!("npd-tail-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("f.log");
-        fs::write(&path, "l1\nl2\nl3\nl4\n").unwrap();
-        assert_eq!(tail(&path, 2), "l3\nl4");
-        assert_eq!(tail(&path, 99), "l1\nl2\nl3\nl4");
-        assert_eq!(tail(&dir.join("missing"), 5), "");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

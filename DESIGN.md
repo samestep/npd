@@ -114,8 +114,11 @@ else lives in it. Build logs are stored nowhere: Nix keeps them under
 ~/.cache/nix-npd/
   npd.sqlite                    # observation log (tiny)
   evals/<commit>-<sys>-<profile>-v<n>.tsv.zst  # attr→drv maps (zstd), one file per eval
-  logs/eval-<commit>-<sys>.log  # nix-eval-jobs stderr (tracebacks), per eval
 ```
+
+`nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a
+package set) is *not* persisted: we drain it into a small in-memory ring buffer
+and surface only its tail if the eval aborts fatally.
 
 `<drv-hash>` is the 32-char hash component of the drvpath.
 
