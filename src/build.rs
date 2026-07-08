@@ -333,9 +333,7 @@ fn build_targets_at(
             .iter()
             .map(|&i| (targets[i].drv_path.as_str(), targets[i].system.as_str()))
             .collect();
-        println!("building {} derivation(s)…", drvs.len());
-        let start = Instant::now();
-        let mut recorded: HashMap<String, (Outcome, f64)> = HashMap::new();
+        let mut recorded: HashMap<String, Outcome> = HashMap::new();
         let attempted = batch_build(&drvs, force, |drv, secs| {
             let outcome = if drv_built(drv)? { Outcome::Built } else { Outcome::Failed };
             store.add_observation(&Observation {
@@ -347,25 +345,23 @@ fn build_targets_at(
                 duration_s: Some(secs),
                 machine: Some(host.clone()),
             })?;
-            recorded.insert(drv.to_string(), (outcome, secs));
+            recorded.insert(drv.to_string(), outcome);
             Ok(())
         })?;
-        let secs = start.elapsed().as_secs_f64();
 
         // Pass 3: attribute the drvs that had no build activity — a drv nix
         // *attempted* failed on its own; one it never attempted either had valid
         // outputs already (substituted, or a prior interrupted run built it) or
-        // was blocked by a failed dependency — then print every target's summary
-        // line. Printing waits until here so it doesn't interleave with nom's
-        // live tree on the terminal.
+        // was blocked by a failed dependency. No per-target result lines: nom's
+        // tree already showed each build's fate, and the report has the rest.
         let leftover: Vec<&str> =
             drvs.iter().copied().filter(|d| !recorded.contains_key(*d)).collect();
         let built_map = build_outcomes(&leftover)?;
         let now = chrono::Utc::now().timestamp();
         for &i in &to_build {
             let t = &targets[i];
-            let (outcome, duration_s) = match recorded.get(&t.drv_path) {
-                Some(&(outcome, secs)) => (outcome, Some(secs)),
+            let outcome = match recorded.get(&t.drv_path) {
+                Some(&outcome) => outcome,
                 None => {
                     let built = built_map.get(&t.drv_path).copied().unwrap_or(false);
                     let outcome = if built {
@@ -384,19 +380,11 @@ fn build_targets_at(
                         duration_s: None,
                         machine: Some(host.clone()),
                     })?;
-                    (outcome, None)
+                    outcome
                 }
             };
-            let label = match outcome {
-                Outcome::Built => "built ",
-                Outcome::Failed => "FAILED",
-                Outcome::DepFailed => "dep-failed",
-            };
-            let dur = duration_s.map(|s| format!(" ({s:.0}s)")).unwrap_or_default();
-            println!("  {label}  {} {}{dur}", t.system, t.attr);
             results[i].outcome = Some(outcome);
         }
-        println!("(built set finished in {secs:.0}s)");
     }
 
     Ok(results)
