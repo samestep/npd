@@ -148,9 +148,12 @@ fn run_eval_pb(
     // undrained pipe) also can't deadlock while we stream stdout.
     let short: String = commit.chars().take(12).collect();
 
+    // No `--meta`: we only keep `attr → drv`, and `--meta` forces each package's
+    // meta attrset (extra evaluation, plus extra allocation that inflates the
+    // GC-heavy heap — especially costly on macOS). It doesn't affect drvPaths, so
+    // cached eval files stay valid.
     let mut child = Command::new("nix-eval-jobs")
         .args([
-            "--meta",
             "--workers",
             &workers.to_string(),
             "--max-memory-size",
