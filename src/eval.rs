@@ -81,17 +81,6 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     }
 }
 
-/// Stream NDJSON values off `reader`, mapping each to an `AttrEval`. Memory stays
-/// bounded to one value at a time rather than the whole (meta-heavy) output.
-fn parse_jobs<R: std::io::Read>(reader: R) -> Result<Vec<AttrEval>> {
-    let mut out = Vec::new();
-    for item in serde_json::Deserializer::from_reader(reader).into_iter::<RawJob>() {
-        let raw = item.context("parsing nix-eval-jobs output")?;
-        out.push(raw_to_attr_eval(raw));
-    }
-    Ok(out)
-}
-
 // --- running the evaluator --------------------------------------------------
 
 /// Build the whole-package-set Nix expression `nix-eval-jobs` walks. The
@@ -813,6 +802,18 @@ pub fn eval_two(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stream NDJSON values off `reader`, mapping each to an `AttrEval` — the
+    /// same job-parse the production streamer does inline, exercised here over a
+    /// fixed buffer rather than a live `nix-eval-jobs` child.
+    fn parse_jobs<R: std::io::Read>(reader: R) -> Result<Vec<AttrEval>> {
+        let mut out = Vec::new();
+        for item in serde_json::Deserializer::from_reader(reader).into_iter::<RawJob>() {
+            let raw = item.context("parsing nix-eval-jobs output")?;
+            out.push(raw_to_attr_eval(raw));
+        }
+        Ok(out)
+    }
 
     #[test]
     fn parses_success_broken_and_error_lines() {

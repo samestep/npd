@@ -33,16 +33,6 @@ pub struct Target {
     pub broken: bool,
 }
 
-/// What happened to one target.
-pub struct Built {
-    pub attr: String,
-    pub system: String,
-    pub drv_path: String,
-    pub decision: Decision,
-    /// The build outcome, when `decision` was `Build` and this was not a dry run.
-    pub outcome: Option<Outcome>,
-}
-
 fn hostname() -> String {
     Command::new("hostname")
         .output()
@@ -217,7 +207,7 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 /// For each target, consult `policy` against the observation log; then build the
 /// whole build set at once. With `dry_run`, decisions are computed and printed
 /// but nothing is built or recorded.
-pub fn build_targets(targets: &[Target], policy: BuildPolicy, dry_run: bool) -> Result<Vec<Built>> {
+pub fn build_targets(targets: &[Target], policy: BuildPolicy, dry_run: bool) -> Result<()> {
     build_targets_at(&eval::db_path()?, targets, policy, dry_run)
 }
 
@@ -227,7 +217,7 @@ fn build_targets_at(
     targets: &[Target],
     policy: BuildPolicy,
     dry_run: bool,
-) -> Result<Vec<Built>> {
+) -> Result<()> {
     let mut store = Store::open(db)?;
     let host = hostname();
     // --recheck / --prefer-local force a genuine local build; otherwise a cached
@@ -277,13 +267,11 @@ fn build_targets_at(
     // Pass 1: decide per target. Skips are silent — a fully-cached run must print
     // nothing; dry-run still lists each would-build target, since that's its point.
     let now = chrono::Utc::now().timestamp();
-    let mut results: Vec<Built> = Vec::with_capacity(targets.len());
     let mut to_build: Vec<usize> = Vec::new();
     for (i, t) in targets.iter().enumerate() {
         let observations = obs_of(&t.drv_path);
         let sub = substitutable(&t.drv_path);
-        let decision = policy.decide(observations, sub, t.broken);
-        match decision {
+        match policy.decide(observations, sub, t.broken) {
             Decision::Build if dry_run => {
                 println!("  would build           {} {}", t.system, t.attr)
             }
@@ -305,13 +293,6 @@ fn build_targets_at(
             }
             Decision::SkipFail | Decision::SkipBroken => {}
         }
-        results.push(Built {
-            attr: t.attr.clone(),
-            system: t.system.clone(),
-            drv_path: t.drv_path.clone(),
-            decision,
-            outcome: None,
-        });
     }
 
     // Pass 2: one nom build for the whole set, recording each drv's outcome the
@@ -359,39 +340,32 @@ fn build_targets_at(
             .iter()
             .copied()
             .filter(|d| !recorded.contains_key(*d))
+            .collect::<HashSet<&str>>()
+            .into_iter()
             .collect();
         let built_map = build_outcomes(&leftover)?;
         let now = chrono::Utc::now().timestamp();
-        for &i in &to_build {
-            let t = &targets[i];
-            let outcome = match recorded.get(&t.drv_path) {
-                Some(&outcome) => outcome,
-                None => {
-                    let built = built_map.get(&t.drv_path).copied().unwrap_or(false);
-                    let outcome = if built {
-                        Outcome::Built
-                    } else if attempted.contains(&t.drv_path) {
-                        Outcome::Failed
-                    } else {
-                        Outcome::DepFailed
-                    };
-                    store.add_observation(&Observation {
-                        drv_path: t.drv_path.clone(),
-                        source: Source::Local,
-                        outcome,
-                        when: now,
-                        system: Some(t.system.clone()),
-                        duration_s: None,
-                        machine: Some(host.clone()),
-                    })?;
-                    outcome
-                }
+        for &drv in &leftover {
+            let outcome = if built_map.get(drv).copied().unwrap_or(false) {
+                Outcome::Built
+            } else if attempted.contains(drv) {
+                Outcome::Failed
+            } else {
+                Outcome::DepFailed
             };
-            results[i].outcome = Some(outcome);
+            store.add_observation(&Observation {
+                drv_path: drv.to_string(),
+                source: Source::Local,
+                outcome,
+                when: now,
+                system: system_of.get(drv).copied().map(str::to_string),
+                duration_s: None,
+                machine: Some(host.clone()),
+            })?;
         }
     }
 
-    Ok(results)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -484,29 +458,27 @@ mod tests {
             "failure was not recorded while the batch was still building"
         );
 
-        let results = builder.join().unwrap().unwrap();
-        let outcome_of = |attr: &str| {
-            results
-                .iter()
-                .find(|b| b.attr == attr)
-                .unwrap()
-                .outcome
-                .unwrap()
+        builder.join().unwrap().unwrap();
+
+        // Every outcome is recovered from the observation log — the same ground
+        // truth the production path renders from. Each drv is observed exactly
+        // once: the failure and the slow success from their own build activity,
+        // the blocked drv from the post-batch output-validity sweep.
+        let s = Store::open(&db).unwrap();
+        let obs_of = |drv: &str| {
+            let obs = s.load_observations(drv).unwrap();
+            assert_eq!(obs.len(), 1, "exactly one local observation per drv");
+            obs.into_iter().next().unwrap()
         };
-        assert_eq!(outcome_of("fail"), Outcome::Failed);
-        assert_eq!(outcome_of("slow"), Outcome::Built);
-        assert_eq!(outcome_of("blocked"), Outcome::DepFailed);
+        assert_eq!(obs_of(&fail).outcome, Outcome::Failed);
+        assert_eq!(obs_of(&slow).outcome, Outcome::Built);
+        assert_eq!(obs_of(&blocked).outcome, Outcome::DepFailed);
 
         // The incrementally-recorded facts carry a duration and the system.
-        let s = Store::open(&db).unwrap();
-        let fail_obs = s.load_observations(&fail).unwrap();
-        assert_eq!(fail_obs.len(), 1);
-        assert_eq!(fail_obs[0].source, Source::Local);
-        assert!(fail_obs[0].duration_s.is_some());
-        assert_eq!(fail_obs[0].system.as_deref(), Some("testsys"));
-        let blocked_obs = s.load_observations(&blocked).unwrap();
-        assert_eq!(blocked_obs.len(), 1);
-        assert_eq!(blocked_obs[0].outcome, Outcome::DepFailed);
+        let fail_obs = obs_of(&fail);
+        assert_eq!(fail_obs.source, Source::Local);
+        assert!(fail_obs.duration_s.is_some());
+        assert_eq!(fail_obs.system.as_deref(), Some("testsys"));
 
         let _ = fs::remove_dir_all(&dir);
     }

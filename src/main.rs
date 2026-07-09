@@ -4,10 +4,6 @@
 //! `npd` is a single command that evaluates a `base → head` change, builds
 //! whatever the changed set needs, and renders a Markdown report.
 
-// A few model/eval helpers are kept as clean public API even where the single
-// command doesn't currently exercise them.
-#![allow(dead_code)]
-
 mod build;
 mod cache;
 mod eval;
