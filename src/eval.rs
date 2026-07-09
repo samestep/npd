@@ -145,7 +145,7 @@ fn stream_jobs<T>(
     // `per_worker_mb` *KiB*, every worker trips it after its first job, and
     // each subsequent job pays a full worker restart + nixpkgs re-import
     // (~100× slower end-to-end). Compensate by passing the cap ×1024 on macOS.
-    // Remove once https://github.com/nix-community/nix-eval-jobs/issues (bytes
+    // Remove once https://github.com/NixOS/nix-eval-jobs/issues (bytes
     // vs KiB in `shouldRestart`, src/worker.cc) is fixed upstream.
     let max_memory_size = if cfg!(target_os = "macos") {
         per_worker_mb * 1024

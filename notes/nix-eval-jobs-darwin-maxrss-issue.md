@@ -1,4 +1,4 @@
-# Draft upstream issue for nix-community/nix-eval-jobs
+# Draft upstream issue for NixOS/nix-eval-jobs
 
 Title: **~100× slowdown on macOS: `--max-memory-size` check misreads `ru_maxrss` (bytes on Darwin, KiB on Linux), so the worker restarts after every job**
 
