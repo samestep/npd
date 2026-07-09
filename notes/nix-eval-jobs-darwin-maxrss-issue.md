@@ -20,11 +20,17 @@ return maxrss > args.maxMemorySize * KB_TO_BYTES;
 
 `--max-memory-size` is documented in MiB. On **Linux**, `ru_maxrss` is in
 **kilobytes** (getrusage(2)), so `MiB * 1024 = KiB` and the comparison is
-correct. On **macOS**, `ru_maxrss` is in **bytes** — note Apple's man page
-still says "kilobytes", but that text is inherited from 4.4BSD and contradicts
-Apple's kernel: XNU fills the field from Mach task info, whose unit is bytes
+correct. On **macOS**, `ru_maxrss` is in **bytes**, per Apple's current
+[getrusage(2) man page](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getrusage.2)
+("the maximum resident set size utilized (in bytes)", corrected in OS X 10.8 —
+beware the pre-2012 copy in Apple's Documentation Archive that still says
+"kilobytes") and the kernel itself: XNU fills the field from Mach task info,
+whose unit is bytes
 ([`kern_resource.c`: `ru_maxrss = (long)tinfo.resident_size_max`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_resource.c),
 [`task_info.h`: `resident_size_max; /* maximum resident memory size (bytes) */`](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/task_info.h)).
+This is a classic portability trap — libuv normalizes it with the comment
+["Most platforms report ru_maxrss in kilobytes; macOS and Solaris are the
+outliers because of course they are"](https://github.com/libuv/libuv/blob/v1.x/src/unix/core.c#L1126-L1133).
 Empirically, a process that touches 256 MiB reports `ru_maxrss = 263104` on
 Linux and `269910016` on macOS. So on Darwin the effective limit is
 `--max-memory-size` **KiB**: the default 4096 becomes a 4 MiB cap. Every
