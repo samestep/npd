@@ -3,6 +3,11 @@
 Read DESIGN.md before making non-trivial changes; it is the source of truth for
 the architecture and is kept up to date as part of any change that affects it.
 
+## Commit directly to `main`
+
+Development happens on `main`. Don't create feature branches or open pull
+requests for changes here — commit straight to `main`.
+
 ## No backward compatibility, ever
 
 npd has exactly one user, no releases, and no deployments. Everything it stores
