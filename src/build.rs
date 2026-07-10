@@ -423,9 +423,8 @@ mod tests {
             })
             .collect();
         let db2 = db.clone();
-        let builder = std::thread::spawn(move || {
-            build_targets_at(&db2, &targets, BuildPolicy::default())
-        });
+        let builder =
+            std::thread::spawn(move || build_targets_at(&db2, &targets, BuildPolicy::default()));
 
         // The failure is near-instant, the success sleeps 8s; its Failed row
         // must land while the batch (and the thread driving it) still runs.

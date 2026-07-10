@@ -246,7 +246,15 @@ impl Store {
                     "INSERT OR REPLACE INTO test_drv \
                      (commit_, system, profile, pkg_attr, test_attr, drv_path, broken) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![commit, system, profile, j.pkg_attr, j.test_attr, drv, j.broken],
+                    params![
+                        commit,
+                        system,
+                        profile,
+                        j.pkg_attr,
+                        j.test_attr,
+                        drv,
+                        j.broken
+                    ],
                 )?;
             }
         }
