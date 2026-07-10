@@ -6,7 +6,7 @@
 long-lived build machines with plenty of disk. It exists to make these cheap:
 
 - evaluate a revision → the set of `attr → derivation` on each platform;
-- diff two revisions (and, three-way, their merge base) to a set of changed attrs;
+- diff two revisions to a set of changed attrs;
 - learn whether a derivation is already substitutable from `cache.nixos.org`;
 - build derivations locally, remembering the outcome (Nix keeps the log itself);
 - render human-readable Markdown reports from all of the above;
@@ -148,8 +148,6 @@ commit, and full drv paths are stored as-is like the observation log.
 package set) is *not* persisted: we drain it into a small in-memory ring buffer
 and surface only its tail if the eval aborts fatally.
 
-`<drv-hash>` is the 32-char hash component of the drvpath.
-
 ## 5. The observation log and the build-policy predicate
 
 Every local build appends an `Observation` (source, outcome, when, duration,
@@ -190,7 +188,7 @@ including the failures nix itself forgets — and a re-run only re-pays for the
 in-flight and never-started builds. Drvs with no build activity (blocked by a
 failed dep, or valid without a build) are attributed in a post-batch sweep.
 
-## 6. Evaluation, its cache key, and the three-way diff
+## 6. Evaluation, its cache key, and the diff
 
 **The cache key is `(commit, system, config)`, and it is not a can of worms —
 provided `npd` owns the config.** What determines the attr→drv map is the
@@ -212,19 +210,13 @@ fixed by the `system` key. So "should we cache evals?" — yes, unreservedly, on
 `eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
 pure). Each attr carries its drv plus one meta bit — marked
 broken/unsupported/insecure — since meta is *not* part of the drv hash, so the
-build policy and report can't recover it from the drv alone. A two-way diff is
-a set-diff on `(attr, drv_path, broken)` — a meta-only (un)marking changes no
-drv but is still a review event and gets a row. The **three-way** diff also
-evaluates the **merge base** of the two commits, which classifies each changed
-attr the way a git three-way merge does:
-
-- changed by *this side* only (base == merge-base, differs at head),
-- changed by the *other side* only (head == merge-base, differs at base — e.g.
-  the target branch advanced / a mass rebuild landed),
-- changed by *both* (all three differ — genuine interaction).
-
-This is the main capability nixpkgs-review lacks; it is nearly free once
-`eval` is a cached primitive.
+build policy and report can't recover it from the drv alone. The diff is a
+set-diff on `(attr, drv_path, broken)` — a meta-only (un)marking changes no
+drv but is still a review event and gets a row. (An earlier design also
+sketched a *three-way* diff against the merge base, classifying each changed
+attr as changed-by-this-side / by-the-other / by-both; it turned out not to
+matter in practice and was dropped. The merge base survives only as the
+*default base* of a report.)
 
 **`--tests` — the changed set's `passthru.tests`.** Ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397): for each
@@ -301,12 +293,13 @@ absent (no such attr on that side — a *known* fact, never a `?`), `❓` unbuil
 (has a drv, no fact yet; only under `--no-build`). A section is one `(base, head)`
 state pair, and its header **is** a composable `before → after` token (one emoji
 per side) — no per-row glyphs; the section a row lands in carries all the meaning.
-Sections are ordered worst-delta-first and folded in `<details>` (open when the
-state changed, collapsed when `before == after`). Attrs that share a derivation
+Sections are ordered worst-delta-first, each folded in a `<details>` (an
+earlier draft opened changed-state sections by default; all-collapsed read
+better). Attrs that share a derivation
 are collapsed onto one line (`a = b = c`, shortest attr first), like
 `nixpkgs-review`'s aliases — npd gets this for free from its drvpath keying.
 
-`npd report` is not merely read-only: with defaults (`head` = `HEAD`, `base` =
+An `npd` run is not merely read-only: with defaults (`head` = `HEAD`, `base` =
 merge-base with `master`) it first **builds both sides of the changed set**
 (skipping anything already known or substitutable), so a fresh report has a real
 state for every row rather than a wall of `❓`. `--no-build` opts back into pure
@@ -318,7 +311,7 @@ The spine is implemented (✓).
 
 1. ✓ cached `eval(commit, system)` → attr→drv map (`nix-eval-jobs`), evals run
    in parallel under a RAM-slot budget.
-2. ✓ two-way diff, then the three-way (merge-base) diff.
+2. ✓ the two-way diff (base defaults to the merge-base with `master`).
 3. ✓ the drvpath-keyed observation store + `BuildPolicy` + a local build driver
    that consults/appends it: one batched `nom` build, parallel cache probing,
    `DepFailed`/cascade detection, and per-drv duration.
@@ -350,11 +343,9 @@ and fixed by [nix-eval-jobs#426](https://github.com/NixOS/nix-eval-jobs/pull/426
 macOS (see `stream_jobs` in `src/eval.rs`); drop that once the fix reaches the
 `nix-eval-jobs` npd runs.
 
-## 10. Open questions
+## 10. Resolved questions
 
-- The report classifier's eventual home (§8) — revisit when we get to reports.
-
-Resolved earlier and recorded for context:
+Recorded for context:
 
 - *Eval cache key* → `(commit, system, profile)` with an eval-version tag; not a
   can of worms because `npd` owns the config (§6).

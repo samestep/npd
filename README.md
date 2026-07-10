@@ -57,6 +57,6 @@ with concurrent cache probing.
 Toolchain comes from the flake (like `npc`): `direnv allow`, or `nix develop`.
 
 ```sh
-nix develop --command cargo test    # run the model tests
+nix develop --command cargo test    # unit tests (an ignored end-to-end test needs real nix)
 nix develop --command cargo run -- --help
 ```
