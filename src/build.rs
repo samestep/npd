@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::cache;
@@ -150,18 +150,6 @@ fn batch_build(
     Ok(attempted)
 }
 
-/// The realised output paths of a derivation.
-fn drv_outputs(drv: &str) -> Result<Vec<String>> {
-    let out = Command::new("nix-store")
-        .args(["--query", "--outputs", drv])
-        .output()
-        .context("running nix-store --query --outputs")?;
-    if !out.status.success() {
-        bail!("nix-store --query --outputs {drv} failed");
-    }
-    Ok(lines(&out.stdout))
-}
-
 /// Which of `paths` are NOT valid in the local store (i.e. weren't built).
 fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
     if paths.is_empty() {
@@ -174,13 +162,13 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
         .args(paths)
         .output()
         .context("running nix-store --check-validity")?;
-    Ok(lines(&out.stdout).into_iter().collect())
+    Ok(cache::lines(&out.stdout).into_iter().collect())
 }
 
 /// Did this drv's build succeed — are all its outputs valid in the local
 /// store? Sound at stop-event time; see `batch_build`.
 fn drv_built(drv: &str) -> Result<bool> {
-    let outs = drv_outputs(drv)?;
+    let outs = cache::drv_outputs(drv)?;
     Ok(!outs.is_empty() && invalid_paths(&outs)?.is_empty())
 }
 
@@ -189,7 +177,7 @@ fn build_outcomes(drvs: &[&str]) -> Result<HashMap<String, bool>> {
     let mut per_drv: Vec<(String, Vec<String>)> = Vec::new();
     let mut all = Vec::new();
     for &d in drvs {
-        let outs = drv_outputs(d)?;
+        let outs = cache::drv_outputs(d)?;
         all.extend(outs.iter().cloned());
         per_drv.push((d.to_string(), outs));
     }
@@ -201,14 +189,6 @@ fn build_outcomes(drvs: &[&str]) -> Result<HashMap<String, bool>> {
             (d, built)
         })
         .collect())
-}
-
-fn lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
 }
 
 /// For each target, consult `policy` against the observation log; then build the

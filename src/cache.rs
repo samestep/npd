@@ -8,6 +8,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use anyhow::{Context, Result, bail};
+
 const CACHE: &str = "https://cache.nixos.org";
 
 /// How many narinfo probes to run at once. These are independent HTTP HEADs, so
@@ -20,21 +22,27 @@ fn store_hash(path: &str) -> Option<&str> {
     path.rsplit('/').next().and_then(|n| n.split('-').next())
 }
 
-/// The realised output paths of a derivation (empty if the .drv isn't present).
-fn store_outputs(drv: &str) -> Vec<String> {
-    Command::new("nix-store")
+/// The realised output paths of a derivation, via `nix-store --query
+/// --outputs` (fails if the .drv isn't in the local store). The one such
+/// helper — the build driver's validity checks use it too.
+pub fn drv_outputs(drv: &str) -> Result<Vec<String>> {
+    let out = Command::new("nix-store")
         .args(["--query", "--outputs", drv])
         .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+        .context("running nix-store --query --outputs")?;
+    if !out.status.success() {
+        bail!("nix-store --query --outputs {drv} failed");
+    }
+    Ok(lines(&out.stdout))
+}
+
+/// Non-empty trimmed lines of a command's output.
+pub fn lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Is this exact output path in the binary cache? (narinfo HEAD -> 2xx.)
@@ -50,9 +58,13 @@ fn output_in_cache(out_path: &str) -> bool {
 
 /// Is any of `drv`'s outputs in the binary cache — i.e. substitutable without a
 /// local build? Used by the build driver to avoid "building" (really fetching)
-/// a cached path and mislabelling it as a local build.
-pub fn in_cache(drv: &str) -> bool {
-    store_outputs(drv).iter().any(|o| output_in_cache(o))
+/// a cached path and mislabelling it as a local build. A drv whose outputs
+/// can't even be queried probes as not-substitutable — the safe direction: the
+/// driver just builds it.
+fn in_cache(drv: &str) -> bool {
+    drv_outputs(drv)
+        .map(|outs| outs.iter().any(|o| output_in_cache(o)))
+        .unwrap_or(false)
 }
 
 /// Probe several drvs at once, returning `drv -> substitutable?`. A shared cursor
