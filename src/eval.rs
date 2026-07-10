@@ -213,10 +213,21 @@ fn stream_jobs<T>(
     let mut attrs = Vec::new();
     for item in serde_json::Deserializer::from_reader(BufReader::new(stdout)).into_iter::<RawJob>()
     {
-        attrs.push(map_job(item.context("parsing nix-eval-jobs output")?));
+        match item.context("parsing nix-eval-jobs output") {
+            Ok(raw) => attrs.push(map_job(raw)),
+            Err(e) => {
+                // A `Child` is not killed on drop: bail out without reaping and
+                // a multi-GB nix-eval-jobs (plus its workers) keeps evaluating
+                // into the void. Kill it (which also ends the stderr thread via
+                // EOF) before surfacing the parse error.
+                let _ = child.kill();
+                let _ = child.wait();
+                pb.abandon_with_message(format!("eval of {label} failed"));
+                return Err(e);
+            }
+        }
         pb.set_message(format!("evaluating {label} — {} attrs", attrs.len()));
     }
-    pb.finish_with_message(format!("evaluated {label} — {} attrs", attrs.len()));
 
     let status = child.wait().context("waiting for nix-eval-jobs")?;
     let stderr_tail = stderr_tail.join().unwrap_or_default();
@@ -229,6 +240,7 @@ fn stream_jobs<T>(
     // all. Caching that would poison every future diff/report with phantom
     // "removed" packages, so we refuse it outright rather than trust a partial.
     if !status.success() {
+        pb.abandon_with_message(format!("eval of {label} failed (truncated)"));
         bail!(
             "nix-eval-jobs did not finish evaluating {label}: it exited \
              {status} after streaming {} attr(s), so the result is truncated and \
@@ -239,6 +251,9 @@ fn stream_jobs<T>(
             stderr_tail,
         );
     }
+    // Declare success only after the integrity gate: a truncated eval must not
+    // flash an "evaluated …" line before the error.
+    pb.finish_with_message(format!("evaluated {label} — {} attrs", attrs.len()));
     Ok(attrs)
 }
 
