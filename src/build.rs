@@ -217,8 +217,7 @@ pub fn build_targets(targets: &[Target], policy: BuildPolicy) -> Result<()> {
 /// [`build_targets`] against an explicit observation DB (separable for tests).
 /// Probe the substituter for every target the log knows nothing about and
 /// record a `Cache`/`Built` observation per hit — the fact-gathering half of
-/// the decision phase, separable so its HTTP round trips can run early
-/// ([`preprobe`]) and hide behind whatever else is still going on.
+/// the decision phase.
 ///
 /// We only probe drvs with *no fact*: a probe can only change the decision
 /// there. A drv with any local observation is already decided (built → skip;
@@ -272,14 +271,6 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
     Ok(())
 }
 
-/// Run [`probe_new_facts`] for a target set ahead of the build phase — called
-/// per system as soon as its evals land, so the substituter round trips
-/// overlap the remaining evals instead of serializing after them.
-pub fn preprobe(targets: &[Target], policy: BuildPolicy) -> Result<()> {
-    let mut store = Store::open(&crate::paths::db_path()?)?;
-    probe_new_facts(&mut store, targets, policy)
-}
-
 fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolicy) -> Result<()> {
     let mut store = Store::open(db)?;
     let host = hostname();
@@ -287,9 +278,8 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
     // (substitutable) output means we needn't build at all.
     let force = policy.recheck || policy.prefer_local;
 
-    // Gather any missing cache facts (usually a no-op: `preprobe` already ran
-    // per system while evals were still finishing), then load every target's
-    // history in one SQLite round-trip — an all-known set costs a single query.
+    // Gather any missing cache facts, then load every target's history in one
+    // SQLite round-trip — an all-known set costs a single query, no network.
     probe_new_facts(&mut store, targets, policy)?;
     let drv_refs: Vec<&str> = targets.iter().map(|t| t.drv_path.as_str()).collect();
     let obs_by_drv = store.load_observations_many(&drv_refs)?;

@@ -178,12 +178,9 @@ SQLite query, and only *probes the cache* for drvs it doesn't already know are
 built (locally, or from a `Cache` observation a prior run recorded); those probes
 run concurrently (`cache::in_cache_many`). So a changed set whose facts are all
 known costs one query and no network — the whole build set is decided in
-milliseconds. Probing also starts *early*: the eval queue (§6) signals each
-eval's completion, so a system's diff and substituter probes run as soon as
-*its* pair of evals lands, hiding the HTTP round trips behind the other
-systems' still-running shards. Builds, by contrast, stay strictly behind all
-evals: they are the memory heavyweights, and co-scheduling them with eval
-workers risks an OOM-killed build being recorded as a false `Failed` fact.
+milliseconds. (Builds stay strictly behind the eval phase: they are the memory
+heavyweights, and co-scheduling them with eval workers risks an OOM-killed
+build being recorded as a false `Failed` fact.)
 The actual build is a single batched `nix build` piped through
 `nom` for the live tree, from which we recover, per drv, its outcome (built /
 direct failure / dependency cascade) and duration.

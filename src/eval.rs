@@ -387,11 +387,6 @@ pub struct EvalOpts {
     pub worker_mem_mb: Option<u64>,
 }
 
-/// Callback fired (from a queue worker thread) the moment one
-/// `(commit, system)` eval has been persisted, so the caller can start that
-/// eval's downstream work while the rest are still running.
-pub type EvalDone<'a> = &'a (dyn Fn(&str, &str) + Sync);
-
 /// A fatal `nix-eval-jobs` abort (non-zero exit): the streamed output was
 /// truncated and discarded. A marker type so the scheduler can recognize it
 /// through the anyhow chain and requeue the shard at reduced concurrency.
@@ -522,19 +517,7 @@ struct Shard {
 /// success (AIMD). Completed shards persist immediately ([`partial_path`]),
 /// so any interruption resumes at shard granularity; when an eval's last
 /// shard lands, its rows are assembled and written as the one cached file.
-/// Is `(commit, system)`'s eval already on disk? Callers use this to know
-/// which completions to expect from `eval_pairs`'s `on_done` callback (cached
-/// pairs never fire it).
-pub fn eval_cached(commit: &str, system: &str) -> Result<bool> {
-    Ok(eval_path(commit, system)?.exists())
-}
-
-pub fn eval_pairs(
-    repo: &Path,
-    pairs: &[(String, String)],
-    opts: EvalOpts,
-    on_done: Option<EvalDone>,
-) -> Result<()> {
+pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
     // Dedupe: `npd X X` (or repeated --system) would otherwise run the same
     // eval twice concurrently — harmless (the write is atomic) but 2× the work.
@@ -693,11 +676,6 @@ pub fn eval_pairs(
                                 ev.label,
                                 rows.len()
                             ));
-                            // Freshly persisted: let the caller start this
-                            // eval's downstream work while the rest continue.
-                            if let Some(f) = on_done {
-                                f(ev.commit, ev.system);
-                            }
                         }
                         Ok(())
                     };
@@ -748,7 +726,6 @@ pub fn eval_two(
     head: &str,
     systems: &[String],
     opts: EvalOpts,
-    on_done: Option<EvalDone>,
 ) -> Result<()> {
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(systems.len() * 2);
     for s in systems {
@@ -757,7 +734,7 @@ pub fn eval_two(
     for s in systems {
         pairs.push((head.to_string(), s.clone()));
     }
-    eval_pairs(repo, &pairs, opts, on_done)
+    eval_pairs(repo, &pairs, opts)
 }
 
 #[cfg(test)]

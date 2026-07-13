@@ -232,89 +232,15 @@ fn run(cli: Cli) -> Result<()> {
     let (base, head) = resolve_base_head(&repo, cli.base, cli.head)?;
     let systems = resolve_systems(cli.system);
 
-    // Evaluate; as each system's pair of evals lands, diff it (a linear merge
-    // of the two sorted eval files) and pre-probe the substituter, so the HTTP
-    // round trips overlap the remaining evals. Builds stay strictly after all
-    // evals — probes are cheap HEADs, builds are the memory heavyweights, and
-    // co-scheduling those with eval workers risks pressure-induced false
-    // Failed facts.
+    eval::eval_two(&repo, &base, &head, &systems, opts)?;
+
+    // The changed set per system — each attr's drv + meta-blocked bit per side —
+    // from a linear merge of the two sorted eval files. Computed once, reused
+    // for build+render.
     let mut per_system_changed: Vec<(String, Vec<evalfile::ChangedAttr>)> = Vec::new();
-    {
-        let process = |sys: &str| -> Result<Vec<evalfile::ChangedAttr>> {
-            let changed = evalfile::changed_set(&base, &head, sys)?;
-            if !cli.no_build {
-                let one = (sys.to_string(), changed.clone());
-                build::preprobe(&assemble_targets(std::slice::from_ref(&one)), policy)?;
-            }
-            Ok(changed)
-        };
-        // How many fresh evals each system waits on: cached evals never fire
-        // the callback, and base == head shares one eval.
-        let mut waiting: HashMap<String, usize> = HashMap::new();
-        for sys in &systems {
-            let mut n = 0;
-            for c in [&base, &head][..if base == head { 1 } else { 2 }].iter() {
-                if !eval::eval_cached(c, sys)? {
-                    n += 1;
-                }
-            }
-            waiting.insert(sys.clone(), n);
-        }
-        let mut done: HashMap<String, Vec<evalfile::ChangedAttr>> = HashMap::new();
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::scope(|s| -> Result<()> {
-            let evals = s.spawn(|| {
-                // Sender isn't Sync; the callback is called from several queue
-                // workers, so serialize sends through a mutex.
-                let tx = std::sync::Mutex::new(tx);
-                let notify = move |_c: &str, sys: &str| {
-                    let _ = tx.lock().unwrap().send(sys.to_string());
-                };
-                eval::eval_two(&repo, &base, &head, &systems, opts, Some(&notify))
-            });
-            // Fully-cached systems are ready immediately; the rest become
-            // ready as their last fresh eval lands. Anything missed here
-            // (e.g. the channel closing on an eval error) is swept up after
-            // the join below.
-            let mut result: Result<()> = Ok(());
-            let mut ready: Vec<String> = waiting
-                .iter()
-                .filter(|&(_, n)| *n == 0)
-                .map(|(sys, _)| sys.clone())
-                .collect();
-            loop {
-                for sys in ready.drain(..) {
-                    if result.is_ok() {
-                        match process(&sys) {
-                            Ok(changed) => {
-                                done.insert(sys, changed);
-                            }
-                            Err(e) => result = Err(e),
-                        }
-                    }
-                }
-                match rx.recv() {
-                    Ok(sys) => {
-                        if let Some(n) = waiting.get_mut(&sys) {
-                            *n = n.saturating_sub(1);
-                            if *n == 0 {
-                                ready.push(sys);
-                            }
-                        }
-                    }
-                    Err(_) => break, // eval thread done; its sender dropped
-                }
-            }
-            evals.join().expect("eval thread panicked")?;
-            result
-        })?;
-        for sys in &systems {
-            let changed = match done.remove(sys) {
-                Some(c) => c,
-                None => process(sys)?, // post-join sweep
-            };
-            per_system_changed.push((sys.clone(), changed));
-        }
+    for sys in &systems {
+        let changed = evalfile::changed_set(&base, &head, sys)?;
+        per_system_changed.push((sys.clone(), changed));
     }
 
     // --tests: expand each system's changed set with the changed packages'
