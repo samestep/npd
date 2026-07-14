@@ -894,31 +894,49 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
     // Enumerating a cold commit reads and hashes its whole source tree (a few
     // seconds each — even on Nix ≥2.35, where the tree is no longer *copied*
     // into the store, the content-addressed hash still forces a full read), and
-    // this loop runs before the shard scheduler starts its own display. So drive
-    // a small animated line here too, from a refresher thread, or a fresh
-    // multi-system run just sits silent for those seconds.
+    // this runs before the shard scheduler starts its own display. Two things
+    // follow. Run the enumerations concurrently: each distinct commit's hash is
+    // independent, so base and head overlap instead of summing (measured ~2×),
+    // and Nix's fetcher locks serialize same-commit races so a warm same-commit
+    // pair still returns cheaply. And drive an animated line from a refresher
+    // thread, or a fresh multi-system run just sits silent for those seconds.
+    // Bounded by `slots` like the shard pool — a lone nix-instantiate here is
+    // ~0.5 GB (well under a shard worker's cap), so this is a conservative
+    // ceiling that can't oversubscribe RAM.
     let mut labels = Vec::new();
     let mut items = Vec::new();
     let mut meta: Vec<(&str, &str)> = Vec::new();
     {
         let total = todo.len();
+        let names: Vec<Mutex<Option<Vec<String>>>> = (0..total).map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
-        let current = Mutex::new(String::new());
+        let running = AtomicUsize::new(0);
+        let fatal: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         let display = Mutex::new(Live::new());
         let finished = AtomicBool::new(false);
         let start = Instant::now();
-        let outcome = thread::scope(|s| -> Result<()> {
+        let workers = slots.min(total).max(1);
+        thread::scope(|s| {
+            // Refresher: the sole terminal writer, animating spinner + timer.
             {
-                let (done, current, display, finished) = (&done, &current, &display, &finished);
+                let (done, running, display, finished) = (&done, &running, &display, &finished);
                 s.spawn(move || {
                     let mut tick = 0usize;
                     while !finished.load(Ordering::Relaxed) {
-                        let cur = current.lock().unwrap().clone();
+                        let (d, r) = (
+                            done.load(Ordering::Relaxed),
+                            running.load(Ordering::Relaxed),
+                        );
+                        let count = if r > 0 {
+                            format!("{d}+{r}/{total}")
+                        } else {
+                            format!("{d}/{total}")
+                        };
                         let line = format!(
-                            "{} ⏱ {}  enumerating top-level attrs: {cur} ({}/{total})",
+                            "{} ⏱ {}  enumerating top-level attrs {count}",
                             spinner(tick),
                             human_elapsed(start.elapsed()),
-                            done.load(Ordering::Relaxed),
                         );
                         display.lock().unwrap().draw(&[line]);
                         thread::sleep(Duration::from_millis(100));
@@ -926,29 +944,58 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                     }
                 });
             }
-            let mut res = Ok(());
-            for &i in &todo {
-                let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
-                let short: String = commit.chars().take(12).collect();
-                *current.lock().unwrap() = format!("{short} {system}");
-                match enumerate_names(repo, commit, system) {
-                    Ok(names) => {
-                        labels.push(format!("{short} {system}"));
-                        items.push(names);
-                        meta.push((commit, system));
-                        done.fetch_add(1, Ordering::Relaxed);
+            // Workers pull the next `todo` index off a shared counter, stash the
+            // result in its slot, and stop on the first fatal error.
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let (next, done, running, fatal, names, todo) =
+                    (&next, &done, &running, &fatal, &names, &todo);
+                handles.push(s.spawn(move || {
+                    while fatal.lock().unwrap().is_none() {
+                        let pos = next.fetch_add(1, Ordering::Relaxed);
+                        if pos >= total {
+                            return;
+                        }
+                        let i = todo[pos];
+                        let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
+                        running.fetch_add(1, Ordering::Relaxed);
+                        let outcome = enumerate_names(repo, commit, system);
+                        running.fetch_sub(1, Ordering::Relaxed);
+                        match outcome {
+                            Ok(v) => {
+                                *names[pos].lock().unwrap() = Some(v);
+                                done.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                fatal.lock().unwrap().get_or_insert(e);
+                                return;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        res = Err(e);
-                        break;
-                    }
-                }
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
             }
             finished.store(true, Ordering::Relaxed);
-            res
         });
         display.lock().unwrap().clear();
-        outcome?;
+        if let Some(e) = fatal.into_inner().unwrap() {
+            return Err(e);
+        }
+        // Assemble in `todo` order (no fatal error ⇒ every slot is filled).
+        for (pos, slot) in names.into_iter().enumerate() {
+            let i = todo[pos];
+            let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
+            let short: String = commit.chars().take(12).collect();
+            labels.push(format!("{short} {system}"));
+            items.push(
+                slot.into_inner()
+                    .unwrap()
+                    .expect("enumerated when no error"),
+            );
+            meta.push((commit, system));
+        }
     }
 
     run_shards(
