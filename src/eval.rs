@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,20 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
         attr: raw.attr,
         drv_path: raw.drv_path,
         broken: meta_broken(&raw.meta.unwrap_or_default()),
+    }
+}
+
+/// Map a `--tests` job to a [`TestJob`]. Label from `attrPath` (unquoted
+/// elements) rather than `attr` (which nix-eval-jobs quotes for the dotted
+/// package component, e.g. `"python3Packages.requests".tests.foo`): element 0
+/// is the package we asked for, and the whole path joined is the clean
+/// `<pkg>.tests.<name>` label.
+fn raw_to_test_job(raw: RawJob) -> TestJob {
+    TestJob {
+        pkg_attr: raw.attr_path.first().cloned().unwrap_or_default(),
+        test_attr: raw.attr_path.join("."),
+        broken: meta_broken(&raw.meta.unwrap_or_default()),
+        drv_path: raw.drv_path,
     }
 }
 
@@ -342,70 +356,42 @@ pub fn eval_tests(
     if attrs.is_empty() {
         return Ok(Vec::new());
     }
-    let expr = build_tests_expr(repo, commit, system, attrs);
-    // A targeted eval over a small changed set: a couple of workers is plenty,
-    // and each still re-evaluates the nixpkgs spine, so more would only waste RAM.
-    let workers = attrs.len().clamp(1, 4);
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let slots = eval_slots(cores, total_mem_mb(), DEFAULT_WORKER_MEM_MB, None);
+    // Slice the changed packages into ~`slots` shards through the shared
+    // scheduler — one line with a `done + running / total` count, and up to
+    // `slots` tests evaluated at once (each a nixosTest ≈ a whole NixOS system,
+    // so the AIMD backoff earns its keep here). ~slots shards keeps the nixpkgs
+    // spine re-imported no more than the old single `--workers` eval did.
+    let shard_size = attrs.len().div_ceil(slots).max(1);
     let short: String = commit.chars().take(12).collect();
     let label = format!("tests {short} ({system})");
-    let start = Instant::now();
-    // Label and split from `attrPath` (unquoted elements) rather than `attr`
-    // (which nix-eval-jobs quotes for the dotted package component, e.g.
-    // `"python3Packages.requests".tests.foo`): element 0 is the package we asked
-    // for (the job tree is keyed by it), and the whole path joined is the clean
-    // `<pkg>.tests.<name>` label.
-    let map = |raw: RawJob| {
-        let pkg_attr = raw.attr_path.first().cloned().unwrap_or_default();
-        let test_attr = raw.attr_path.join(".");
-        let broken = meta_broken(&raw.meta.unwrap_or_default());
-        TestJob {
-            pkg_attr,
-            test_attr,
-            drv_path: raw.drv_path,
-            broken,
-        }
-    };
-    // A single `passthru.tests` entry is usually a `nixosTest` — evaluating one
-    // means evaluating a whole NixOS system, seconds apiece — so emissions are
-    // sparse. Drive the line from a 100ms refresher thread (not the per-emission
-    // callback, which leaves the spinner and timer frozen during a slow test and
-    // reads as a hang); the callback only bumps the count.
-    let n = AtomicUsize::new(0);
-    let done = AtomicBool::new(false);
-    let r = thread::scope(|s| {
-        {
-            let (n, done, label) = (&n, &done, &label);
-            s.spawn(move || {
-                let mut live = Live::new();
-                let mut tick = 0usize;
-                while !done.load(Ordering::Relaxed) {
-                    live.draw(&[format!(
-                        "{} ⏱ {} evaluating {label} — {} tests",
-                        spinner(tick),
-                        human_elapsed(start.elapsed()),
-                        n.load(Ordering::Relaxed),
-                    )]);
-                    thread::sleep(Duration::from_millis(100));
-                    tick += 1;
-                }
-                live.clear();
-            });
-        }
-        let r = stream_jobs(&expr, workers, DEFAULT_WORKER_MEM_MB, &label, map, || {
-            n.fetch_add(1, Ordering::Relaxed);
-        });
-        done.store(true, Ordering::Relaxed);
-        r
-    });
-    // Keep a frozen summary on screen, matching the full-set eval's line.
-    if r.is_ok() {
-        eprintln!(
-            "⏱ {} evaluated {label} — {} tests",
-            human_elapsed(start.elapsed()),
-            n.load(Ordering::Relaxed),
-        );
-    }
-    r
+    let collected: Mutex<Vec<TestJob>> = Mutex::new(Vec::new());
+    run_shards(
+        vec![label],
+        vec![attrs.to_vec()],
+        shard_size,
+        slots,
+        "tests",
+        |_gi, label, pkgs, on_item| {
+            let expr = build_tests_expr(repo, commit, system, pkgs);
+            stream_jobs(
+                &expr,
+                1,
+                DEFAULT_WORKER_MEM_MB,
+                label,
+                raw_to_test_job,
+                || on_item(1),
+            )
+        },
+        |_gi, rows| {
+            collected.lock().unwrap().extend(rows);
+            Ok(())
+        },
+    )?;
+    Ok(collected.into_inner().unwrap())
 }
 
 // --- scheduling: one queue of shards (DESIGN §6) ------------------------------
@@ -564,6 +550,18 @@ fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> Stri
     )
 }
 
+/// The directory holding one eval's shard partials (deleted once the eval is
+/// assembled).
+fn partial_dir(commit: &str, system: &str) -> Result<PathBuf> {
+    Ok(crate::paths::cache_root()?
+        .join("evals")
+        .join("partial")
+        .join(format!(
+            "{commit}-{system}-v{}",
+            crate::evalfile::EVAL_VERSION
+        )))
+}
+
 /// Where one shard's completed rows persist until its whole eval is assembled
 /// (then the eval's `partial/` dir is deleted). Content-addressed by the
 /// shard's names, so a change in sharding layout simply misses rather than
@@ -573,22 +571,275 @@ fn partial_path(commit: &str, system: &str, names: &[String]) -> Result<PathBuf>
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     names.hash(&mut h);
-    Ok(crate::paths::cache_root()?
-        .join("evals")
-        .join("partial")
-        .join(format!(
-            "{commit}-{system}-v{}",
-            crate::evalfile::EVAL_VERSION
-        ))
-        .join(format!("{:016x}.tsv", h.finish())))
+    Ok(partial_dir(commit, system)?.join(format!("{:016x}.tsv", h.finish())))
 }
 
-/// One unit of work: a slice of one eval's top-level names.
+// --- the shard scheduler (shared by the full-set eval and the --tests eval) ---
+
+/// One group of shards run together: one line in the progress display, one
+/// assembled result. Its `items` (top-level names for the full eval, changed
+/// packages for `--tests`) are sliced into shards; the counters below drive the
+/// `done + running / total` display and are owned by [`run_shards`].
+struct ShardGroup<T> {
+    label: String,
+    items: Vec<String>,
+    shards_total: usize,
+    shards_done: AtomicUsize,
+    shards_running: AtomicUsize,
+    items_done: AtomicUsize,
+    rows: Mutex<Vec<T>>,
+}
+
+/// A queued unit of work: a slice of one group's items.
 struct Shard {
-    /// Index into the per-eval state vec.
-    eval: usize,
-    /// Range within that eval's name list.
-    names: std::ops::Range<usize>,
+    group: usize,
+    items: std::ops::Range<usize>,
+}
+
+/// Run a set of shard groups through one bounded, AIMD-controlled worker pool
+/// with a live `done + running / total` display, shared by both eval paths
+/// (DESIGN §6). Persistence and resume are the caller's job (via the closures),
+/// since the full eval assembles a flat file while `--tests` returns rows for
+/// SQLite (DESIGN §4); this owns only the scheduling and the display.
+///
+/// `eval_shard(group, label, items, on_item)` evaluates one shard's item slice
+/// to its rows, calling `on_item(n)` as items surface (drives the live count);
+/// it may return an [`EvalAborted`] error to have the shard requeued at reduced
+/// concurrency, or any other error to fail the whole run. `on_group_complete`
+/// fires the moment a group's last shard lands, with the group's assembled rows.
+fn run_shards<T: Send>(
+    labels: Vec<String>,
+    items: Vec<Vec<String>>,
+    shard_size: usize,
+    slots: usize,
+    unit: &str,
+    eval_shard: impl Fn(usize, &str, &[String], &(dyn Fn(usize) + Sync)) -> Result<Vec<T>> + Sync,
+    on_group_complete: impl Fn(usize, Vec<T>) -> Result<()> + Sync,
+) -> Result<()> {
+    let shard_size = shard_size.max(1);
+    let groups: Vec<ShardGroup<T>> = labels
+        .into_iter()
+        .zip(items)
+        .map(|(label, items)| ShardGroup {
+            label,
+            shards_total: items.len().div_ceil(shard_size),
+            items,
+            shards_done: AtomicUsize::new(0),
+            shards_running: AtomicUsize::new(0),
+            items_done: AtomicUsize::new(0),
+            rows: Mutex::new(Vec::new()),
+        })
+        .collect();
+
+    let mut queue: VecDeque<Shard> = VecDeque::new();
+    for (gi, g) in groups.iter().enumerate() {
+        let mut s = 0;
+        while s < g.items.len() {
+            let e = (s + shard_size).min(g.items.len());
+            queue.push_back(Shard {
+                group: gi,
+                items: s..e,
+            });
+            s = e;
+        }
+    }
+    if queue.is_empty() {
+        return Ok(());
+    }
+    // No point in more workers than shards.
+    let slots = slots.min(queue.len());
+    let label_w = groups.iter().map(|g| g.label.len()).max().unwrap_or(0);
+
+    let display = Mutex::new(Live::new());
+    let start = Instant::now();
+
+    // One line per group: `done + running / total` shards (the `+running` term
+    // elided once idle), item count right-aligned in a fixed column.
+    let render = |g: &ShardGroup<T>| -> String {
+        let done = g.shards_done.load(Ordering::Relaxed);
+        let running = g.shards_running.load(Ordering::Relaxed);
+        let done_items = g.items_done.load(Ordering::Relaxed);
+        let verb = if done == g.shards_total {
+            "evaluated"
+        } else {
+            "evaluating"
+        };
+        let shards = if running > 0 {
+            format!("{done}+{running}/{}", g.shards_total)
+        } else {
+            format!("{done}/{}", g.shards_total)
+        };
+        format!(
+            "  {verb:<10} {label:<label_w$}  {done_items:>6} {unit}  {shards} shards",
+            label = g.label,
+        )
+    };
+    let render_total = || -> String {
+        let (mut done, mut running, mut total, mut done_items) = (0, 0, 0, 0);
+        for g in &groups {
+            done += g.shards_done.load(Ordering::Relaxed);
+            running += g.shards_running.load(Ordering::Relaxed);
+            total += g.shards_total;
+            done_items += g.items_done.load(Ordering::Relaxed);
+        }
+        let verb = if done == total {
+            "evaluated"
+        } else {
+            "evaluating"
+        };
+        let shards = if running > 0 {
+            format!("{done}+{running}/{total}")
+        } else {
+            format!("{done}/{total}")
+        };
+        format!("{verb} {shards} shards, {done_items} {unit}")
+    };
+
+    struct Q {
+        queue: VecDeque<Shard>,
+        /// Shards not yet completed (queued or running); requeues don't count
+        /// down, so workers only exit when everything truly finished (or fatal).
+        outstanding: usize,
+        fatal: Option<anyhow::Error>,
+    }
+    let q = Mutex::new(Q {
+        outstanding: queue.len(),
+        queue,
+        fatal: None,
+    });
+    // AIMD over the slot count: halve on an abort (multiplicative decrease), +1
+    // back toward the starting value per few clean shards (additive increase).
+    let target = AtomicUsize::new(slots);
+    let successes = AtomicUsize::new(0);
+
+    thread::scope(|s| {
+        // A single refresher owns every terminal write: workers only bump
+        // atomics, and this thread draws the whole block at a steady 100 ms
+        // (animating the spinner + timer) until the queue drains.
+        {
+            let (q, groups, display) = (&q, &groups, &display);
+            let (render, render_total) = (&render, &render_total);
+            s.spawn(move || {
+                let mut tick = 0usize;
+                loop {
+                    let mut lines: Vec<String> = groups.iter().map(render).collect();
+                    lines.push(format!(
+                        "{} ⏱ {} {}",
+                        spinner(tick),
+                        human_elapsed(start.elapsed()),
+                        render_total(),
+                    ));
+                    display.lock().unwrap().draw(&lines);
+                    {
+                        let g = q.lock().unwrap();
+                        if g.fatal.is_some() || g.outstanding == 0 {
+                            return;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    tick += 1;
+                }
+            });
+        }
+        for w in 0..slots {
+            let (q, target, successes, groups, display, eval_shard, on_group_complete) = (
+                &q,
+                &target,
+                &successes,
+                &groups,
+                &display,
+                &eval_shard,
+                &on_group_complete,
+            );
+            s.spawn(move || {
+                loop {
+                    let shard = {
+                        let mut g = q.lock().unwrap();
+                        if g.fatal.is_some() || g.outstanding == 0 {
+                            return;
+                        }
+                        // Parked slots (w >= target) and an empty-but-not-done
+                        // queue both just wait: an aborted shard may requeue.
+                        if w < target.load(Ordering::Relaxed) {
+                            g.queue.pop_front()
+                        } else {
+                            None
+                        }
+                    };
+                    let Some(shard) = shard else {
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    };
+                    let g = &groups[shard.group];
+                    let slice = &g.items[shard.items.clone()];
+
+                    g.shards_running.fetch_add(1, Ordering::Relaxed);
+                    let outcome = (|| -> Result<()> {
+                        let on_item = |n: usize| {
+                            g.items_done.fetch_add(n, Ordering::Relaxed);
+                        };
+                        let rows = eval_shard(shard.group, &g.label, slice, &on_item)?;
+                        g.rows.lock().unwrap().extend(rows);
+                        let done = g.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == g.shards_total {
+                            let rows = std::mem::take(&mut *g.rows.lock().unwrap());
+                            // Pin the count to the assembled rows in case the
+                            // streamed/resumed tallies drifted.
+                            g.items_done.store(rows.len(), Ordering::Relaxed);
+                            on_group_complete(shard.group, rows)?;
+                        }
+                        Ok(())
+                    })();
+                    g.shards_running.fetch_sub(1, Ordering::Relaxed);
+
+                    match outcome {
+                        Ok(()) => {
+                            q.lock().unwrap().outstanding -= 1;
+                            let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
+                            let t = target.load(Ordering::Relaxed);
+                            if n % 4 == 0 && t < slots {
+                                target.store(t + 1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
+                            let t = target.load(Ordering::Relaxed);
+                            let nt = (t / 2).max(1);
+                            target.store(nt, Ordering::Relaxed);
+                            successes.store(0, Ordering::Relaxed);
+                            display.lock().unwrap().print_above(&format!(
+                                "  a shard of {} aborted — likely out of memory; \
+                                 requeued, slots {t} -> {nt}",
+                                g.label,
+                            ));
+                            q.lock().unwrap().queue.push_back(shard);
+                        }
+                        Err(e) => {
+                            let mut g = q.lock().unwrap();
+                            if g.fatal.is_none() {
+                                g.fatal = Some(e);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Erase the live block and reprint the finished lines as ordinary output, so
+    // the summary stays on screen and a later resize reflows it like any
+    // command's output (the block itself was already resize-safe; see
+    // `crate::live`).
+    display.lock().unwrap().clear();
+    match q.into_inner().unwrap().fatal {
+        Some(e) => Err(e),
+        None => {
+            for g in &groups {
+                eprintln!("{}", render(g));
+            }
+            eprintln!("⏱ {} {}", human_elapsed(start.elapsed()), render_total());
+            Ok(())
+        }
+    }
 }
 
 /// Ensure every `(commit, system)` pair has a cached eval file, via **one
@@ -620,287 +871,53 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
         .unwrap_or(4);
     let slots = eval_slots(cores, total_mem_mb(), per_worker_mb, opts.slots);
 
-    /// Per-eval bookkeeping shared by the queue workers.
-    struct Eval<'a> {
-        commit: &'a str,
-        system: &'a str,
-        short: String,
-        label: String,
-        names: Vec<String>,
-        shards_total: usize,
-        shards_done: AtomicUsize,
-        /// Shards of this eval a worker is evaluating right now — the middle of
-        /// the `done + running / total` triple the line shows.
-        shards_running: AtomicUsize,
-        attrs_done: AtomicUsize,
-        rows: Mutex<Vec<AttrEval>>,
-    }
-
-    // Widest system name in play, so the per-eval lines align into columns
-    // instead of wobbling as the verb / system / attr count change width.
-    let sys_w = todo.iter().map(|&i| pairs[i].1.len()).max().unwrap_or(0);
-
-    let mut evals: Vec<Eval> = Vec::new();
-    let mut queue: VecDeque<Shard> = VecDeque::new();
+    // One shard group per `(commit, system)`; its items are the top-level attr
+    // names. `meta` keeps the identifying pair per group for the closures.
+    let mut labels = Vec::new();
+    let mut items = Vec::new();
+    let mut meta: Vec<(&str, &str)> = Vec::new();
     for &i in &todo {
-        let (commit, system) = (&pairs[i].0, &pairs[i].1);
+        let (commit, system) = (pairs[i].0.as_str(), pairs[i].1.as_str());
         let names = enumerate_names(repo, commit, system)?;
-        let idx = evals.len();
-        let mut shards_total = 0;
-        let mut s = 0;
-        while s < names.len() {
-            let e = (s + NAMES_PER_SHARD).min(names.len());
-            queue.push_back(Shard {
-                eval: idx,
-                names: s..e,
-            });
-            shards_total += 1;
-            s = e;
-        }
         let short: String = commit.chars().take(12).collect();
-        evals.push(Eval {
-            commit,
-            system,
-            label: format!("{short} ({system})"),
-            short,
-            names,
-            shards_total,
-            shards_done: AtomicUsize::new(0),
-            shards_running: AtomicUsize::new(0),
-            attrs_done: AtomicUsize::new(0),
-            rows: Mutex::new(Vec::new()),
-        });
+        labels.push(format!("{short} {system}"));
+        items.push(names);
+        meta.push((commit, system));
     }
 
-    // The live display: one line per eval plus, at the bottom, the one timer —
-    // every eval starts within the same instant, so a per-eval clock apiece was
-    // just near-identical timers jittering out of sync (a single elapsed plus a
-    // running grand total reads cleaner). A refresher thread owns every write;
-    // workers only bump atomics. See `crate::live` for why it truncates rather
-    // than pads (resize stays sane).
-    let display = Mutex::new(Live::new());
-    let start = Instant::now();
-
-    // One line per eval; `done + running / total` shards (the `+running` term
-    // elided once nothing is in flight), attrs right-aligned so the count sits
-    // in a fixed column. `attrs_done` includes rows recovered from partials, so
-    // a resumed eval's count matches its shard count.
-    let render = |ev: &Eval| -> String {
-        let done = ev.shards_done.load(Ordering::Relaxed);
-        let running = ev.shards_running.load(Ordering::Relaxed);
-        let attrs = ev.attrs_done.load(Ordering::Relaxed);
-        let verb = if done == ev.shards_total {
-            "evaluated"
-        } else {
-            "evaluating"
-        };
-        let shards = if running > 0 {
-            format!("{done}+{running}/{}", ev.shards_total)
-        } else {
-            format!("{done}/{}", ev.shards_total)
-        };
-        format!(
-            "  {verb:<10} {short} {system:<sys_w$}  {attrs:>6} attrs  {shards} shards",
-            short = ev.short,
-            system = ev.system,
-        )
-    };
-    let render_total = |evals: &[Eval]| -> String {
-        let (mut done, mut running, mut total, mut attrs) = (0, 0, 0, 0);
-        for ev in evals {
-            done += ev.shards_done.load(Ordering::Relaxed);
-            running += ev.shards_running.load(Ordering::Relaxed);
-            total += ev.shards_total;
-            attrs += ev.attrs_done.load(Ordering::Relaxed);
-        }
-        let verb = if done == total {
-            "evaluated"
-        } else {
-            "evaluating"
-        };
-        let shards = if running > 0 {
-            format!("{done}+{running}/{total}")
-        } else {
-            format!("{done}/{total}")
-        };
-        format!("{verb} {shards} shards, {attrs} attrs")
-    };
-
-    struct Q {
-        queue: VecDeque<Shard>,
-        /// Shards not yet completed (queued or running); requeues don't count
-        /// down, so workers only exit when everything truly finished (or on a
-        /// fatal error).
-        outstanding: usize,
-        fatal: Option<anyhow::Error>,
-    }
-    let q = Mutex::new(Q {
-        outstanding: queue.len(),
-        queue,
-        fatal: None,
-    });
-    // AIMD over the slot count: halve on an abort (multiplicative decrease),
-    // +1 back toward the starting value per few clean shards (additive
-    // increase) — titrating concurrency against whatever RAM is really
-    // available right now instead of measuring it.
-    let target = AtomicUsize::new(slots);
-    let successes = AtomicUsize::new(0);
-
-    thread::scope(|s| {
-        // A single refresher owns every terminal write: workers only bump
-        // atomics (no rendering in the per-attr hot path), and this thread draws
-        // the whole block at a steady 100 ms until the queue drains. Advancing
-        // the spinner one frame per tick is what animates it.
-        {
-            let (q, evals, display) = (&q, &evals, &display);
-            let (render, render_total) = (&render, &render_total);
-            s.spawn(move || {
-                let mut tick = 0usize;
-                loop {
-                    let mut lines: Vec<String> = evals.iter().map(render).collect();
-                    lines.push(format!(
-                        "{} ⏱ {} {}",
-                        spinner(tick),
-                        human_elapsed(start.elapsed()),
-                        render_total(evals),
-                    ));
-                    display.lock().unwrap().draw(&lines);
-                    {
-                        let g = q.lock().unwrap();
-                        if g.fatal.is_some() || g.outstanding == 0 {
-                            return;
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                    tick += 1;
-                }
-            });
-        }
-        for w in 0..slots {
-            let (q, target, successes, evals, display) =
-                (&q, &target, &successes, &evals, &display);
-            s.spawn(move || {
-                loop {
-                    let shard = {
-                        let mut g = q.lock().unwrap();
-                        if g.fatal.is_some() || g.outstanding == 0 {
-                            return;
-                        }
-                        // Parked slots (w >= target) and an empty-but-not-done
-                        // queue both just wait: an aborted shard may requeue.
-                        if w < target.load(Ordering::Relaxed) {
-                            g.queue.pop_front()
-                        } else {
-                            None
-                        }
-                    };
-                    let Some(shard) = shard else {
-                        thread::sleep(Duration::from_millis(200));
-                        continue;
-                    };
-                    let ev = &evals[shard.eval];
-                    let names = &ev.names[shard.names.clone()];
-
-                    let step = || -> Result<()> {
-                        let ppath = partial_path(ev.commit, ev.system, names)?;
-                        let rows = match crate::evalfile::read_partial(&ppath)? {
-                            // Resumed from a prior run: the streamer's per-attr
-                            // callback never fires, so credit the attrs here —
-                            // otherwise a resumed eval's count trails its shards.
-                            Some(rows) => {
-                                ev.attrs_done.fetch_add(rows.len(), Ordering::Relaxed);
-                                rows
-                            }
-                            None => {
-                                let expr = shard_expr(repo, ev.commit, ev.system, names);
-                                let rows = stream_jobs(
-                                    &expr,
-                                    1,
-                                    per_worker_mb,
-                                    &ev.label,
-                                    raw_to_attr_eval,
-                                    || {
-                                        ev.attrs_done.fetch_add(1, Ordering::Relaxed);
-                                    },
-                                )?;
-                                // Best-effort: a failed persist only costs the
-                                // ability to resume this shard later.
-                                let _ = crate::evalfile::write_partial(&ppath, &rows);
-                                rows
-                            }
-                        };
-                        ev.rows.lock().unwrap().extend(rows);
-                        let done = ev.shards_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done == ev.shards_total {
-                            let rows = std::mem::take(&mut *ev.rows.lock().unwrap());
-                            write_eval(&eval_path(ev.commit, ev.system)?, &rows)?;
-                            if let Some(dir) = ppath.parent() {
-                                let _ = fs::remove_dir_all(dir);
-                            }
-                            // The assembled file is authoritative — pin the
-                            // count to it in case streamed/resumed tallies drift.
-                            ev.attrs_done.store(rows.len(), Ordering::Relaxed);
-                        }
-                        Ok(())
-                    };
-
-                    ev.shards_running.fetch_add(1, Ordering::Relaxed);
-                    let outcome = step();
-                    ev.shards_running.fetch_sub(1, Ordering::Relaxed);
-                    match outcome {
-                        Ok(()) => {
-                            q.lock().unwrap().outstanding -= 1;
-                            let n = successes.fetch_add(1, Ordering::Relaxed) + 1;
-                            let t = target.load(Ordering::Relaxed);
-                            if n % 4 == 0 && t < slots {
-                                target.store(t + 1, Ordering::Relaxed);
-                            }
-                        }
-                        Err(e) if e.downcast_ref::<EvalAborted>().is_some() => {
-                            let t = target.load(Ordering::Relaxed);
-                            let nt = (t / 2).max(1);
-                            target.store(nt, Ordering::Relaxed);
-                            successes.store(0, Ordering::Relaxed);
-                            display.lock().unwrap().print_above(&format!(
-                                "  a shard of {} aborted — likely out of memory; \
-                                 requeued, slots {t} -> {nt}",
-                                ev.label,
-                            ));
-                            q.lock().unwrap().queue.push_back(shard);
-                        }
-                        Err(e) => {
-                            let mut g = q.lock().unwrap();
-                            if g.fatal.is_none() {
-                                g.fatal = Some(e);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    // Erase the live block and reprint the finished lines as ordinary output, so
-    // the eval summary stays on screen and a later resize reflows it like any
-    // command's output (the block itself was already resize-safe; see
-    // `crate::live`).
-    display.lock().unwrap().clear();
-    match q.into_inner().unwrap().fatal {
-        Some(e) => Err(e),
-        None => {
-            for ev in &evals {
-                eprintln!("{}", render(ev));
+    run_shards(
+        labels,
+        items,
+        NAMES_PER_SHARD,
+        slots,
+        "attrs",
+        // Evaluate one shard — resuming from a persisted partial if present,
+        // else streaming it and persisting the partial for a later resume.
+        |gi, label, names, on_item| {
+            let (commit, system) = meta[gi];
+            let ppath = partial_path(commit, system, names)?;
+            if let Some(rows) = crate::evalfile::read_partial(&ppath)? {
+                // Resumed: the streamer's per-attr callback never fires, so
+                // credit the attrs here or a resumed eval's count trails.
+                on_item(rows.len());
+                return Ok(rows);
             }
-            // Keep the timer and grand total on screen (no spinner — it's frozen)
-            // so it's easy to look back at how long the eval took, like `nom`.
-            eprintln!(
-                "⏱ {} {}",
-                human_elapsed(start.elapsed()),
-                render_total(&evals),
-            );
+            let expr = shard_expr(repo, commit, system, names);
+            let rows = stream_jobs(&expr, 1, per_worker_mb, label, raw_to_attr_eval, || {
+                on_item(1)
+            })?;
+            // Best-effort: a failed persist only costs the ability to resume.
+            let _ = crate::evalfile::write_partial(&ppath, &rows);
+            Ok(rows)
+        },
+        // Assemble the eval into its one cached file and drop its partials.
+        |gi, rows| {
+            let (commit, system) = meta[gi];
+            write_eval(&eval_path(commit, system)?, &rows)?;
+            let _ = fs::remove_dir_all(partial_dir(commit, system)?);
             Ok(())
-        }
-    }
+        },
+    )
 }
 
 /// Ensure both commits are evaluated across all systems (they run concurrently).

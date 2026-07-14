@@ -358,9 +358,15 @@ test's drv is a pure function of `(commit, system, package-attr)` — it
 does not depend on the base/head pairing — so the cache keys on the package, not
 the changed set, which means a package evaluated in one review is reused in any
 other at that commit. Each run looks up which changed packages are already
-cached and evaluates only the misses (in one batched `nix-eval-jobs`, so the
-nixpkgs-spine cost is paid once, not per package); a fully-cached re-run touches
-no `nix-eval-jobs` at all. Caching matters here because evaluating a test's drv
+cached and evaluates only the misses through the **same shard scheduler as the
+full-set eval** (`run_shards` in `src/eval.rs`): the misses are sliced into
+~`eval-slots` shards so several run at once (a `nixosTest` ≈ a whole NixOS
+system, so the AIMD memory backoff matters), and the run gets the identical
+`done + running / total` progress line. Sharing the scheduler means its
+concurrency logic is exercised — and kept correct — by both paths rather than
+diverging. Persistence stays path-specific (§4): the full eval assembles a flat
+file, `--tests` returns rows for the per-package SQLite cache. A fully-cached
+re-run touches no `nix-eval-jobs` at all. Caching matters here because evaluating a test's drv
 means evaluating its whole derivation graph, and a `nixosTest` in `passthru.tests`
 pulls in an entire NixOS system — seconds and hundreds of MB *per test* — so a
 changed set with a few dozen server/library packages is a minute of evaluation
