@@ -343,39 +343,52 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
         .replace("@ATTRS@", &list)
 }
 
-/// Evaluate the `passthru.tests` of `attrs` at `commit`/`system` into [`TestJob`]s
-/// (one per resolved `<pkg>.tests.<name>`). This is the *miss* path of the cache:
-/// callers pass only the packages not already cached (see `main`). Returns an
-/// empty vec for an empty `attrs`.
-pub fn eval_tests(
+/// Evaluate the `passthru.tests` of several `(commit, system, packages)`
+/// requests **together**, through one shard scheduler — so `--tests` schedules
+/// and displays them as a unit (all lines up front, one shared queue, cross-eval
+/// load balancing) like the full eval, rather than one request at a time.
+/// Returns the resolved [`TestJob`]s per request, parallel to `requests` (one
+/// `<pkg>.tests.<name>` per job). Callers pass only the packages not already
+/// cached (see `main`); an empty/all-empty `requests` does no work.
+pub fn eval_tests_many(
     repo: &Path,
-    commit: &str,
-    system: &str,
-    attrs: &[String],
-) -> Result<Vec<TestJob>> {
-    if attrs.is_empty() {
-        return Ok(Vec::new());
-    }
+    requests: &[(String, String, Vec<String>)],
+) -> Result<Vec<Vec<TestJob>>> {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let slots = eval_slots(cores, total_mem_mb(), DEFAULT_WORKER_MEM_MB, None);
-    // Slice the changed packages into ~`slots` shards through the shared
-    // scheduler — one line with a `done + running / total` count, and up to
-    // `slots` tests evaluated at once (each a nixosTest ≈ a whole NixOS system,
-    // so the AIMD backoff earns its keep here). ~slots shards keeps the nixpkgs
-    // spine re-imported no more than the old single `--workers` eval did.
-    let shard_size = attrs.len().div_ceil(slots).max(1);
-    let short: String = commit.chars().take(12).collect();
-    let label = format!("tests {short} ({system})");
-    let collected: Mutex<Vec<TestJob>> = Mutex::new(Vec::new());
+    // Slice every request's packages into ~2×`slots` shards total, so the pool
+    // stays full and balances across requests (a nixosTest ≈ a whole NixOS
+    // system, so the AIMD backoff earns its keep). ~2×slots keeps the nixpkgs
+    // spine re-imported no more than the old one-request-at-a-time eval did.
+    let total: usize = requests.iter().map(|(_, _, p)| p.len()).sum();
+    let shard_size = total.div_ceil(slots * 2).max(1);
+
+    let labels: Vec<String> = requests
+        .iter()
+        .map(|(commit, system, _)| {
+            let short: String = commit.chars().take(12).collect();
+            format!("tests {short} ({system})")
+        })
+        .collect();
+    let items: Vec<Vec<String>> = requests.iter().map(|(_, _, p)| p.clone()).collect();
+    let meta: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|(c, s, _)| (c.as_str(), s.as_str()))
+        .collect();
+    let results: Vec<Mutex<Vec<TestJob>>> = (0..requests.len())
+        .map(|_| Mutex::new(Vec::new()))
+        .collect();
+
     run_shards(
-        vec![label],
-        vec![attrs.to_vec()],
+        labels,
+        items,
         shard_size,
         slots,
         "tests",
-        |_gi, label, pkgs, on_item| {
+        |gi, label, pkgs, on_item| {
+            let (commit, system) = meta[gi];
             let expr = build_tests_expr(repo, commit, system, pkgs);
             stream_jobs(
                 &expr,
@@ -386,12 +399,16 @@ pub fn eval_tests(
                 || on_item(1),
             )
         },
-        |_gi, rows| {
-            collected.lock().unwrap().extend(rows);
+        |gi, rows| {
+            results[gi].lock().unwrap().extend(rows);
             Ok(())
         },
     )?;
-    Ok(collected.into_inner().unwrap())
+
+    Ok(results
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect())
 }
 
 // --- scheduling: one queue of shards (DESIGN §6) ------------------------------

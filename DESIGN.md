@@ -359,10 +359,13 @@ does not depend on the base/head pairing — so the cache keys on the package, n
 the changed set, which means a package evaluated in one review is reused in any
 other at that commit. Each run looks up which changed packages are already
 cached and evaluates only the misses through the **same shard scheduler as the
-full-set eval** (`run_shards` in `src/eval.rs`): the misses are sliced into
-~`eval-slots` shards so several run at once (a `nixosTest` ≈ a whole NixOS
-system, so the AIMD memory backoff matters), and the run gets the identical
-`done + running / total` progress line. Sharing the scheduler means its
+full-set eval** (`run_shards` in `src/eval.rs`). The misses across *every*
+`(commit, system)` in the review are gathered and evaluated in **one** scheduler
+run — a group per key, all shown and load-balanced together (just as the full
+eval hands all its `(commit, system)` pairs to one queue), rather than one
+key at a time — sliced into ~2×`eval-slots` shards so the pool stays full (a
+`nixosTest` ≈ a whole NixOS system, so the AIMD memory backoff matters). It gets
+the identical `done + running / total` display. Sharing the scheduler means its
 concurrency logic is exercised — and kept correct — by both paths rather than
 diverging. Persistence stays path-specific (§4): the full eval assembles a flat
 file, `--tests` returns rows for the per-package SQLite cache. A fully-cached

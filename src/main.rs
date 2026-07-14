@@ -273,31 +273,6 @@ fn resolve_base_head(
     Ok((base, head))
 }
 
-/// Test drvs for `pkgs` at one revision, via the per-package SQLite cache: look
-/// up which packages are already evaluated, `eval_tests` only the misses, persist
-/// them, then return `test_attr → (drv, broken)` for the whole set. A fully-cached
-/// call runs no `nix-eval-jobs` — just two queries — so a re-run stays instant; a
-/// package evaluated in any prior review at this commit is reused for free.
-fn cached_test_drvs(
-    store: &mut store::Store,
-    repo: &std::path::Path,
-    commit: &str,
-    system: &str,
-    pkgs: &[String],
-) -> Result<std::collections::HashMap<String, (String, bool)>> {
-    let done = store.tests_cached_pkgs(commit, system, pkgs)?;
-    let misses: Vec<String> = pkgs
-        .iter()
-        .filter(|p| !done.contains(*p))
-        .cloned()
-        .collect();
-    if !misses.is_empty() {
-        let jobs = eval::eval_tests(repo, commit, system, &misses)?;
-        store.cache_test_eval(commit, system, &misses, &jobs)?;
-    }
-    store.tests_drvs_for(commit, system, pkgs)
-}
-
 /// Flatten the per-system changed sets into build targets: every side's drv,
 /// deduped per `(system, drv)`.
 ///
@@ -377,23 +352,60 @@ fn run(cli: Cli) -> Result<()> {
     // so building it would build the broken package) unless --build-broken.
     if tests {
         let mut store = store::Store::open(&paths::db_path()?)?;
-        for (sys, changed) in per_system_changed.iter_mut() {
-            let names_on = |unbroken: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
-                let mut v: Vec<String> = changed
+        // The unbroken changed-package names per system, on each side.
+        let per_sys: Vec<(Vec<String>, Vec<String>)> = per_system_changed
+            .iter()
+            .map(|(_, changed)| {
+                let names_on = |unbroken: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
+                    let mut v: Vec<String> = changed
+                        .iter()
+                        .filter(|c| build_broken || unbroken(c))
+                        .map(|c| c.attr.clone())
+                        .collect();
+                    v.sort();
+                    v.dedup();
+                    v
+                };
+                (names_on(|c| !c.base_broken), names_on(|c| !c.head_broken))
+            })
+            .collect();
+
+        // Gather the cache misses across every (commit, system, side) and
+        // evaluate them all through one scheduler, so `--tests` schedules and
+        // displays as a unit like the full eval. Deduped by (commit, system):
+        // with `npd X X`, base and head are the same key (and per the per-package
+        // cache, the same commit on different systems are distinct keys).
+        let mut requests: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for ((sys, _), (base_names, head_names)) in per_system_changed.iter().zip(&per_sys) {
+            for (commit, names) in [(&base, base_names), (&head, head_names)] {
+                if !seen.insert((commit.clone(), sys.clone())) {
+                    continue;
+                }
+                let cached = store.tests_cached_pkgs(commit, sys, names)?;
+                let misses: Vec<String> = names
                     .iter()
-                    .filter(|c| build_broken || unbroken(c))
-                    .map(|c| c.attr.clone())
+                    .filter(|p| !cached.contains(*p))
+                    .cloned()
                     .collect();
-                v.sort();
-                v.dedup();
-                v
-            };
-            let base_names = names_on(|c| !c.base_broken);
-            let head_names = names_on(|c| !c.head_broken);
-            let bmap = cached_test_drvs(&mut store, &repo, &base, sys, &base_names)?;
-            let hmap = cached_test_drvs(&mut store, &repo, &head, sys, &head_names)?;
-            // The same diff the full set went through, so the test rows
-            // classify (regression / fixed / new / meta-only …) identically.
+                if !misses.is_empty() {
+                    requests.push((commit.clone(), sys.clone(), misses));
+                }
+            }
+        }
+        let jobs_per = eval::eval_tests_many(&repo, &requests)?;
+        for ((commit, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
+            store.cache_test_eval(commit, sys, misses, jobs)?;
+        }
+
+        // The per-package cache is now populated; build each system's test-row
+        // diff. The same diff the full set went through, so test rows classify
+        // (regression / fixed / new / meta-only …) identically.
+        for ((sys, changed), (base_names, head_names)) in
+            per_system_changed.iter_mut().zip(&per_sys)
+        {
+            let bmap = store.tests_drvs_for(&base, sys, base_names)?;
+            let hmap = store.tests_drvs_for(&head, sys, head_names)?;
             changed.extend(evalfile::changed_tests(&bmap, &hmap));
         }
     }
