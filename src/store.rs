@@ -186,6 +186,28 @@ impl Store {
         Ok(out)
     }
 
+    /// Every drv whose *local* history is failures-only — at least one local
+    /// observation, none of them (nor a `Cache` hit) a success. This is exactly
+    /// the `local_failed_only` condition [`crate::model::BuildPolicy::decide`]
+    /// applies per drv, lifted to a set so the build driver can propagate a known
+    /// failure *forward* through the dependency graph (DESIGN.md §5): any target
+    /// whose build closure contains such a drv would only `DepFail`, so it can be
+    /// skipped without building. A drv that ever built (locally or, per §7, is
+    /// substitutable via a recorded `Cache`/`Built`) is excluded — nix wouldn't
+    /// re-attempt it as a dependency, so it blocks nothing.
+    pub fn failing_drvs(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT drv_path FROM observation GROUP BY drv_path \
+             HAVING SUM(outcome = 'built') = 0 AND SUM(source = 'local') > 0",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     // --- the `--tests` passthru.tests cache (DESIGN.md §4, §6) ---------------
 
     /// Which of `pkgs` have already had their tests evaluated at this key (so a
@@ -328,6 +350,54 @@ mod tests {
         assert_eq!(got[1].duration_s, Some(1.5));
         // a different drv is independent
         assert!(s.load_observations("/nix/store/y.drv").unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failing_drvs_are_failures_only() {
+        let dir = std::env::temp_dir().join(format!("npd-failing-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let obs = |drv: &str, source, outcome, when| Observation {
+            drv_path: drv.into(),
+            source,
+            outcome,
+            when,
+            system: None,
+            duration_s: None,
+            machine: None,
+        };
+
+        // a: only local failures -> failing.
+        s.add_observation(&obs("/a.drv", Source::Local, Outcome::Failed, 1))
+            .unwrap();
+        s.add_observation(&obs("/a.drv", Source::Local, Outcome::DepFailed, 2))
+            .unwrap();
+        // b: failed then built (flaky success) -> NOT failing.
+        s.add_observation(&obs("/b.drv", Source::Local, Outcome::Failed, 1))
+            .unwrap();
+        s.add_observation(&obs("/b.drv", Source::Local, Outcome::Built, 2))
+            .unwrap();
+        // c: local failure but substitutable (Cache/Built) -> NOT failing.
+        s.add_observation(&obs("/c.drv", Source::Local, Outcome::Failed, 1))
+            .unwrap();
+        s.add_observation(&obs("/c.drv", Source::Cache, Outcome::Built, 2))
+            .unwrap();
+        // d: only a cache hit (never failed locally) -> NOT failing.
+        s.add_observation(&obs("/d.drv", Source::Cache, Outcome::Built, 1))
+            .unwrap();
+        // e: dep-failed only -> failing.
+        s.add_observation(&obs("/e.drv", Source::Local, Outcome::DepFailed, 1))
+            .unwrap();
+
+        let failing = s.failing_drvs().unwrap();
+        assert_eq!(
+            failing,
+            ["/a.drv".to_string(), "/e.drv".to_string()]
+                .into_iter()
+                .collect()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

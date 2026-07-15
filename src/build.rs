@@ -7,7 +7,11 @@
 //!
 //! The observation log exists because Nix remembers successful builds (the
 //! store) but *forgets failures* — without it, a known-failing derivation
-//! gets retried on every run.
+//! gets retried on every run. We record a failure for *any* drv we watch fail,
+//! a transitive dependency included; a target whose build closure contains a
+//! known-failing drv is then skipped before building (it would only cascade to
+//! `DepFailed`), which is how a re-run recovers a dependency failure that a ^C
+//! dropped before the post-build sweep could attribute its dependents.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -73,11 +77,13 @@ const ACT_BUILD: i64 = 105;
 /// is its own, not a dependency's) and its build duration — neither of which a
 /// plain batch build exposes. `--keep-going` so every drv is attempted.
 ///
-/// `on_finish(drv, secs)` fires as each of `drvs`'s build activities stops.
-/// Nix registers a successful build's outputs *before* emitting the stop event
-/// (both the local and build-hook goals `registerValidPaths` before destroying
-/// the `actBuild` Activity — nix 2.34 `derivation-building-goal.cc`), so the
-/// callback can attribute the outcome from output validity right away.
+/// `on_finish(drv, secs)` fires as *every* build activity stops — the requested
+/// drvs and their transitive dependencies alike (the caller records a
+/// dependency only when it failed; DESIGN.md §5). Nix registers a successful
+/// build's outputs *before* emitting the stop event (both the local and
+/// build-hook goals `registerValidPaths` before destroying the `actBuild`
+/// Activity — nix 2.34 `derivation-building-goal.cc`), so the callback can
+/// attribute the outcome from output validity right away.
 ///
 /// Returns every drv nix attempted (build started), dependencies included,
 /// plus nix's own exit status — the caller gates its no-activity *inferences*
@@ -89,7 +95,6 @@ fn batch_build(
     force: bool,
     mut on_finish: impl FnMut(&str, f64) -> Result<()>,
 ) -> Result<(HashSet<String>, std::process::ExitStatus)> {
-    let requested: HashSet<&str> = drvs.iter().copied().collect();
     let installables: Vec<String> = drvs.iter().map(|d| format!("{d}^*")).collect();
     let mut nix = Command::new("nix");
     nix.arg("build").args(&installables).args([
@@ -146,7 +151,6 @@ fn batch_build(
                 "stop" => {
                     if let Some(id) = ev.id
                         && let Some((drv, t0)) = starts.remove(&id)
-                        && requested.contains(drv.as_str())
                     {
                         on_finish(&drv, t0.elapsed().as_secs_f64())?;
                     }
@@ -181,6 +185,29 @@ fn invalid_paths(paths: &[String]) -> Result<HashSet<String>> {
         .args(paths)
         .output()
         .context("running nix-store --check-validity")?;
+    Ok(cache::lines(&out.stdout).into_iter().collect())
+}
+
+/// The build closure of `drvs` as a set of store paths — every input `.drv`
+/// (and source) nix would need to realise them, transitively (`nix-store
+/// --query --requisites`). Used to propagate a known failure forward
+/// (DESIGN.md §5): if a target's closure contains a drv recorded as failing,
+/// building the target would only `DepFail`, so it can be skipped.
+fn drv_closure(drvs: &[&str]) -> Result<HashSet<String>> {
+    if drvs.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let out = Command::new("nix-store")
+        .args(["--query", "--requisites"])
+        .args(drvs)
+        .output()
+        .context("running nix-store --query --requisites")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "nix-store --query --requisites failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     Ok(cache::lines(&out.stdout).into_iter().collect())
 }
 
@@ -332,10 +359,64 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         }
     }
 
+    // Pass 1b: forward-propagate known failures (DESIGN.md §5). A target whose
+    // build closure contains a drv that only-fails locally would just cascade to
+    // `DepFailed`, so drop it from the build set and record that inferred outcome
+    // now (committed immediately, so ^C-safe; and the next run then skips it
+    // straight from its own history). This is what lets a re-run recover a
+    // dependency failure a ^C dropped before the post-batch sweep could attribute
+    // its dependents: the *dependency's* own `Failed` fact (recorded incrementally
+    // in pass 2 below) survives, and pass 1b re-derives the block. `--retry`
+    // re-attempts failures, so it disables the propagation.
+    let failing = if policy.retry {
+        HashSet::new()
+    } else {
+        store.failing_drvs()?
+    };
+    let touches_failing = |drv: &str| -> Result<bool> {
+        Ok(drv_closure(&[drv])?.iter().any(|d| failing.contains(d)))
+    };
+    if !failing.is_empty() && !to_build.is_empty() {
+        // One union query first: if no candidate's closure reaches the failing
+        // set at all, there is nothing to skip and we avoid the per-target walk.
+        let cand: Vec<&str> = to_build
+            .iter()
+            .map(|&i| targets[i].drv_path.as_str())
+            .collect();
+        if drv_closure(&cand)?.iter().any(|d| failing.contains(d)) {
+            let now = unix_now();
+            let mut still_build = Vec::new();
+            let mut blocked_seen: HashSet<&str> = HashSet::new();
+            for &i in &to_build {
+                let drv = targets[i].drv_path.as_str();
+                if !touches_failing(drv)? {
+                    still_build.push(i);
+                    continue;
+                }
+                // Aliased attrs share a drv — record the inferred block once.
+                if blocked_seen.insert(drv) {
+                    store.add_observation(&Observation {
+                        drv_path: drv.to_string(),
+                        source: Source::Local,
+                        outcome: Outcome::DepFailed,
+                        when: now,
+                        system: Some(targets[i].system.clone()),
+                        duration_s: None,
+                        machine: Some(host.clone()),
+                    })?;
+                }
+            }
+            to_build = still_build;
+        }
+    }
+
     // Pass 2: one nom build for the whole set, recording each drv's outcome the
     // moment its build activity stops — its outputs' validity at that instant is
-    // the build's own result (see `batch_build`). Recording incrementally is
-    // what makes ^C mid-batch safe: every fact observed so far is already
+    // the build's own result (see `batch_build`). Both requested targets and
+    // their transitive dependencies fire the callback; a target records its
+    // outcome either way, a dependency only when it *failed* (that failure fact
+    // is what pass 1b propagates forward on a later run). Recording incrementally
+    // is what makes ^C mid-batch safe: every fact observed so far is already
     // committed, so only in-flight and never-started builds cost anything on
     // the next run. (Nix keeps the build log itself; `nix log <drv>` gets it.)
     if !to_build.is_empty() {
@@ -348,23 +429,45 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
             .iter()
             .map(|&i| (targets[i].drv_path.as_str(), targets[i].system.as_str()))
             .collect();
+        let requested: HashSet<&str> = drvs.iter().copied().collect();
         let mut recorded: HashMap<String, Outcome> = HashMap::new();
         let (attempted, status) = batch_build(&drvs, force, |drv, secs| {
-            let outcome = if drv_built(drv)? {
-                Outcome::Built
-            } else {
-                Outcome::Failed
-            };
-            store.add_observation(&Observation {
-                drv_path: drv.to_string(),
-                source: Source::Local,
-                outcome,
-                when: unix_now(),
-                system: system_of.get(drv).copied().map(str::to_string),
-                duration_s: Some(secs),
-                machine: Some(host.clone()),
-            })?;
-            recorded.insert(drv.to_string(), outcome);
+            let built = drv_built(drv)?;
+            if requested.contains(drv) {
+                // A requested target: record its own outcome, success or failure.
+                let outcome = if built {
+                    Outcome::Built
+                } else {
+                    Outcome::Failed
+                };
+                store.add_observation(&Observation {
+                    drv_path: drv.to_string(),
+                    source: Source::Local,
+                    outcome,
+                    when: unix_now(),
+                    system: system_of.get(drv).copied().map(str::to_string),
+                    duration_s: Some(secs),
+                    machine: Some(host.clone()),
+                })?;
+                recorded.insert(drv.to_string(), outcome);
+            } else if !built {
+                // A transitive *dependency* that failed on its own. Record it
+                // (keyed on its drvpath, like every fact) so a later run
+                // propagates the failure forward — skipping any target that would
+                // re-pull it (pass 1b) — and so ^C keeps it. A dependency
+                // *success* needs no row: nix's own store validity already
+                // remembers it, and only failures drive the forward-skip. No
+                // system: a dep isn't tied to one target's platform here.
+                store.add_observation(&Observation {
+                    drv_path: drv.to_string(),
+                    source: Source::Local,
+                    outcome: Outcome::Failed,
+                    when: unix_now(),
+                    system: None,
+                    duration_s: Some(secs),
+                    machine: Some(host.clone()),
+                })?;
+            }
             Ok(())
         })?;
 
@@ -529,6 +632,125 @@ mod tests {
         assert_eq!(fail_obs.source, Source::Local);
         assert!(fail_obs.duration_s.is_some());
         assert_eq!(fail_obs.system.as_deref(), Some("testsys"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A dependency that fails is recorded even though it was never a requested
+    /// target, and its dependent is swept to `DepFailed` — the raw material pass
+    /// 1b later propagates forward (DESIGN.md §5).
+    #[test]
+    #[ignore = "builds real derivations via nix; needs nix, nom"]
+    fn dependency_failure_is_recorded() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npd-depfail-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npd.sqlite");
+
+        // `top` depends on `dep`, which fails. Only `top` is a requested target.
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npd-dep-fail-{nonce}" {{ args = ["-c" "exit 1"]; }};
+                 top = mk "npd-top-{nonce}" {{ args = ["-c" "cat ${{dep}} > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+
+        let targets = [Target {
+            system: "testsys".to_string(),
+            drv_path: top.clone(),
+            broken: false,
+        }];
+        build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        // The dependency's failure is recorded even though it was never a target
+        // — keyed on its own drvpath, from the incremental (dep-branch) record.
+        let dep_obs = s.load_observations(&dep).unwrap();
+        assert_eq!(dep_obs.len(), 1, "the failing dependency is recorded once");
+        assert_eq!(dep_obs[0].source, Source::Local);
+        assert_eq!(dep_obs[0].outcome, Outcome::Failed);
+        // The requested target is blocked by that dependency.
+        let top_obs = s.load_observations(&top).unwrap();
+        assert_eq!(top_obs.len(), 1);
+        assert_eq!(top_obs[0].outcome, Outcome::DepFailed);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The ^C-recovery path (DESIGN.md §5): with a dependency's failure already
+    /// on record (as an interrupted run would have left it) but the dependent
+    /// *un*recorded (its post-batch sweep was skipped by the ^C), a re-run skips
+    /// the dependent from its closure — recording it `DepFailed` — and never
+    /// re-attempts the failing dependency.
+    #[test]
+    #[ignore = "instantiates real derivations via nix; needs nix"]
+    fn known_dependency_failure_skips_dependent_without_rebuilding() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("npd-propagate-test-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("npd.sqlite");
+
+        let expr = format!(
+            r#"let
+                 mk = name: args: derivation ({{
+                   name = name; system = builtins.currentSystem;
+                   builder = "/bin/sh";
+                 }} // args);
+                 dep = mk "npd-pdep-fail-{nonce}" {{ args = ["-c" "exit 1"]; }};
+                 top = mk "npd-ptop-{nonce}" {{ args = ["-c" "cat ${{dep}} > $out"]; }};
+               in {{ inherit dep top; }}"#
+        );
+        let dep = instantiate(&expr, "dep");
+        let top = instantiate(&expr, "top");
+
+        // Simulate the state a ^C leaves: the dependency's failure is recorded,
+        // but the dependent has no observation at all.
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.add_observation(&Observation {
+                drv_path: dep.clone(),
+                source: Source::Local,
+                outcome: Outcome::Failed,
+                when: 1,
+                system: None,
+                duration_s: Some(0.1),
+                machine: Some("host".into()),
+            })
+            .unwrap();
+        }
+
+        let targets = [Target {
+            system: "testsys".to_string(),
+            drv_path: top.clone(),
+            broken: false,
+        }];
+        build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
+
+        let s = Store::open(&db).unwrap();
+        // The dependent was skipped without building and recorded blocked.
+        let top_obs = s.load_observations(&top).unwrap();
+        assert_eq!(top_obs.len(), 1);
+        assert_eq!(top_obs[0].outcome, Outcome::DepFailed);
+        assert_eq!(top_obs[0].system.as_deref(), Some("testsys"));
+        // The failing dependency was NOT re-attempted: still exactly the one
+        // planted observation (a rebuild would have appended a second).
+        assert_eq!(
+            s.load_observations(&dep).unwrap().len(),
+            1,
+            "the known-failing dependency must not be rebuilt"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
