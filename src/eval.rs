@@ -136,6 +136,7 @@ fn stream_jobs<T>(
     expr: &str,
     workers: usize,
     per_worker_mb: u64,
+    instantiate: bool,
     label: &str,
     map_job: impl Fn(RawJob) -> T,
     mut on_item: impl FnMut(),
@@ -181,18 +182,30 @@ fn stream_jobs<T>(
         .write_all(expr.as_bytes())
         .and_then(|()| expr_file.flush())
         .context("writing nix-eval-jobs expr file")?;
-    let mut child = scrub_env(Command::new("nix-eval-jobs").args([
+    let workers_s = workers.to_string();
+    let max_s = max_memory_size.to_string();
+    let mut cmd = Command::new("nix-eval-jobs");
+    cmd.args([
         "--meta",
         "--workers",
-        &workers.to_string(),
+        &workers_s,
         "--max-memory-size",
-        &max_memory_size.to_string(),
-    ]))
-    .arg(expr_file.path())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
+        &max_s,
+    ]);
+    // `--no-instantiate` evaluates without writing the `.drv` files. npd only
+    // needs the drvPath + outputs (both emitted regardless), so skipping the
+    // writes is ~40% faster and avoids instantiating the ~114k attrs it never
+    // builds. The small changed set is instantiated on demand before building
+    // (see [`instantiate`]), which the build and the narinfo probe both need.
+    if !instantiate {
+        cmd.arg("--no-instantiate");
+    }
+    let mut child = scrub_env(&mut cmd)
+        .arg(expr_file.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning nix-eval-jobs (on PATH? use the flake dev shell)")?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let stderr_tail = thread::spawn(move || {
@@ -394,6 +407,7 @@ pub fn eval_tests_many(
                 &expr,
                 1,
                 DEFAULT_WORKER_MEM_MB,
+                false,
                 label,
                 raw_to_test_job,
                 || on_item(1),
@@ -565,6 +579,47 @@ fn shard_expr(repo: &Path, commit: &str, system: &str, names: &[String]) -> Stri
          (map (n: {{ name = n; value = pkgs.${{n}}; }}) [ {list}])",
         build_expr(repo, commit, system)
     )
+}
+
+/// A job expression selecting exactly `paths` out of the package set — each an
+/// attr path, possibly dotted/nested (`python3Packages.foo`, or a test path like
+/// `grafana.tests.grafana.basic`). One job per path, forced per-attr in the
+/// worker, so a path that no longer resolves errors only itself.
+fn select_expr(repo: &Path, commit: &str, system: &str, paths: &[String]) -> String {
+    let list: String = paths
+        .iter()
+        .map(|p| format!("\"{}\" ", nix_escape(p)))
+        .collect();
+    format!(
+        "let pkgs = {}; lib = pkgs.lib; in builtins.listToAttrs \
+         (map (p: {{ name = p; value = lib.attrByPath (lib.splitString \".\" p) null pkgs; }}) [ {list}])",
+        build_expr(repo, commit, system)
+    )
+}
+
+/// Write the changed set's `.drv` files to the store. npd's evals run with
+/// `--no-instantiate` (drvPath + outputs only — no `.drv` writes for the ~114k
+/// attrs it never builds), so the drvs the build and the narinfo probe actually
+/// touch — the small changed set — are materialized here, one `nix-eval-jobs`
+/// run per `(commit, system)` with instantiation on. Streamed rows are
+/// discarded; the store write is the point. Runs only when about to build.
+pub fn instantiate(repo: &Path, requests: &[(String, String, Vec<String>)]) -> Result<()> {
+    for (commit, system, paths) in requests {
+        if paths.is_empty() {
+            continue;
+        }
+        let expr = select_expr(repo, commit, system, paths);
+        stream_jobs(
+            &expr,
+            1,
+            DEFAULT_WORKER_MEM_MB,
+            true,
+            "instantiate",
+            |_| (),
+            || {},
+        )?;
+    }
+    Ok(())
 }
 
 /// The directory holding one eval's shard partials (deleted once the eval is
@@ -1016,9 +1071,15 @@ pub fn eval_pairs(repo: &Path, pairs: &[(String, String)], opts: EvalOpts) -> Re
                 return Ok(rows);
             }
             let expr = shard_expr(repo, commit, system, names);
-            let rows = stream_jobs(&expr, 1, per_worker_mb, label, raw_to_attr_eval, || {
-                on_item(1)
-            })?;
+            let rows = stream_jobs(
+                &expr,
+                1,
+                per_worker_mb,
+                false,
+                label,
+                raw_to_attr_eval,
+                || on_item(1),
+            )?;
             // Best-effort: a failed persist only costs the ability to resume.
             let _ = crate::evalfile::write_partial(&ppath, &rows);
             Ok(rows)

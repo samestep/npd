@@ -414,6 +414,26 @@ fn run(cli: Cli) -> Result<()> {
     // substitutable, or marked broken) so the report has a real state for every
     // row, not a `❓`.
     if !cli.no_build {
+        // The evals ran with --no-instantiate (no `.drv` writes for the ~114k
+        // attrs npd never builds), so materialize just the changed set's `.drv`s
+        // now — the narinfo probe and the build both read them from the store.
+        let mut inst: Vec<(String, String, Vec<String>)> = Vec::new();
+        for (sys, changed) in &per_system_changed {
+            let mut base_attrs = Vec::new();
+            let mut head_attrs = Vec::new();
+            for c in changed {
+                if c.base_drv.is_some() && (build_broken || !c.base_broken) {
+                    base_attrs.push(c.attr.clone());
+                }
+                if c.head_drv.is_some() && (build_broken || !c.head_broken) {
+                    head_attrs.push(c.attr.clone());
+                }
+            }
+            inst.push((base.clone(), sys.clone(), base_attrs));
+            inst.push((head.clone(), sys.clone(), head_attrs));
+        }
+        eval::instantiate(&repo, &inst)?;
+
         let targets = assemble_targets(&per_system_changed);
         if !targets.is_empty() {
             build::build_targets(&targets, policy)?;

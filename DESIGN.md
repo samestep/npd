@@ -296,6 +296,20 @@ attr as changed-by-this-side / by-the-other / by-both; it turned out not to
 matter in practice and was dropped. The merge base survives only as the
 *default base* of a report.)
 
+**Eval does not instantiate; the changed set is materialized before building.**
+`nix-eval-jobs` runs with `--no-instantiate`: npd needs only the `drvPath` and
+`outputs` (both emitted regardless), so it skips writing the `.drv` files — ~40%
+faster (measured, all platforms), and it stops instantiating the ~114k attrs it
+never builds (only the changed set of a few dozen is). The two consumers that
+*do* need the `.drv` present in the store — the narinfo probe (§7, which reads a
+drv's output paths) and the local build (`nix build <drv>^*`, §5) — get it from
+a just-in-time `eval::instantiate` step: one `nix-eval-jobs` run per
+`(commit, system)`, instantiation on, over exactly the changed attr paths
+(nested paths included, via `lib.attrByPath`), run right before building. It is
+skipped under `--no-build`, which needs neither. On a RAM-constrained machine
+the lean `--no-instantiate` workers are also what let npd parallelize at all —
+instantiating workers hit the memory ceiling and thrash (measured on 16 GiB).
+
 **Choosing `base` and `head`.** Three ways, in `resolve_base_head`/`resolve_pr`
 (`src/main.rs`):
 
