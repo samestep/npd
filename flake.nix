@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
     rust-overlay = {
@@ -24,11 +24,34 @@
           overlays = [ (import rust-overlay) ];
         };
         craneLib = crane.mkLib pkgs;
+        # npd needs Nix ≥2.35, whose lazy source-copying is load-bearing for its
+        # disk story: `build_expr`'s `fetchGit` tree is only ever *read*, so 2.35
+        # hashes it without materializing a ~400 MB `/nix/store/…-source` object
+        # per reviewed tree (DESIGN §4). nixpkgs' default `nix` is still the 2.34
+        # series, so pin 2.35 explicitly.
+        nix = pkgs.nixVersions.nix_2_35;
+        # `nix-eval-jobs` links Nix's internals, so it must be the same series —
+        # otherwise the shard eval would still copy the tree. nixpkgs only
+        # packages the 2.34 release yet, so build the 2.35.0 release candidate
+        # (nix-eval-jobs#428) against the matching components. That commit also
+        # carries the macOS `ru_maxrss` fix (#426), letting `stream_jobs` drop its
+        # ×1024 workaround (DESIGN §9).
+        nix-eval-jobs = (pkgs.nix-eval-jobs.override {
+          nixComponents = pkgs.nixVersions.nixComponents_2_35;
+        }).overrideAttrs (_: {
+          version = "2.35.0-unstable-2026-07-16";
+          src = pkgs.fetchFromGitHub {
+            owner = "nix-community";
+            repo = "nix-eval-jobs";
+            rev = "97997acae32aece824bc4c07bcd97f0823783919"; # pr #428 "release 2.35.0"
+            hash = "sha256-/C5wyGYe4uMKKH26vy3knpwP/hvjOHO/58cySL8ADC4=";
+          };
+        });
         # npd shells out to these at runtime; wrap them onto its PATH so the
         # packaged binary works outside the dev shell (`nix shell .`).
         runtimeDeps = [
-          pkgs.nix
-          pkgs.nix-eval-jobs
+          nix
+          nix-eval-jobs
           pkgs.nix-output-monitor # `nom`, the build front-end
           pkgs.git
           pkgs.nettools # `hostname`
@@ -78,8 +101,8 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             pkgs.rust-bin.stable.latest.default
-            pkgs.nix
-            pkgs.nix-eval-jobs
+            nix
+            nix-eval-jobs
             pkgs.nix-output-monitor
             pkgs.sqlite # for poking at the store during development
           ];

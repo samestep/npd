@@ -167,20 +167,6 @@ fn stream_jobs<T>(
     // but it's what carries `broken`/`unsupported`/`insecure` — the bits the
     // build policy needs to skip meta-blocked packages by default.
 
-    // nix-eval-jobs compares `--max-memory-size` (MiB) against `ru_maxrss`
-    // scaled by 1024, which is correct on Linux (KiB) but off by 1024× on
-    // macOS, where `ru_maxrss` is in bytes: the effective cap becomes
-    // `per_worker_mb` *KiB*, every worker trips it after its first job, and
-    // each subsequent job pays a full worker restart + nixpkgs re-import
-    // (~100× slower end-to-end). Compensate by passing the cap ×1024 on macOS.
-    // Fixed upstream (https://github.com/NixOS/nix-eval-jobs/issues/425, via
-    // https://github.com/NixOS/nix-eval-jobs/pull/426); remove once the
-    // nix-eval-jobs on PATH carries that fix.
-    let max_memory_size = if cfg!(target_os = "macos") {
-        per_worker_mb * 1024
-    } else {
-        per_worker_mb
-    };
     // nix-eval-jobs takes the expression inline (`--expr E`) or as a file-path
     // positional. The `--tests` expression lists every changed package, so on a
     // big changed set an inline `--expr` blows past ARG_MAX (E2BIG on spawn);
@@ -198,7 +184,7 @@ fn stream_jobs<T>(
         .and_then(|()| expr_file.flush())
         .context("writing nix-eval-jobs expr file")?;
     let workers_s = workers.to_string();
-    let max_s = max_memory_size.to_string();
+    let max_s = per_worker_mb.to_string();
     let mut cmd = Command::new("nix-eval-jobs");
     cmd.args([
         "--meta",

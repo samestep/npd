@@ -106,6 +106,17 @@ keeps **no gcroots** — a built output may be GC'd, but the *observation* that 
 built survives, and that's the fact we actually need; if the output is wanted
 again, Nix rebuilds or substitutes it.
 
+**npd requires Nix ≥2.35, and this is load-bearing for the disk story.** 2.35
+copies sources to the store lazily: since `build_expr`'s `fetchGit` tree (§6) is
+only ever *read* — imported and walked, never forced to a store path — Nix hashes
+it in place instead of materializing a ~400 MB `/nix/store/…-source` object per
+reviewed tree, which older Nix wrote eagerly (and which npd, keeping no gcroots,
+left for `nix-collect-garbage` to reclaim). Both eval binaries must be 2.35 for
+this to hold — `nix-instantiate` enumerates the attr names and `nix-eval-jobs`
+evaluates the shards, and either one forcing the tree would copy it — so the
+flake pins both to the 2.35 series (`nix-eval-jobs` built from its 2.35.0 release
+candidate, since nixpkgs packages only 2.34 so far; §9).
+
 The two fact kinds have opposite access patterns, so they get different backends.
 
 **Evals → one flat file per `(tree, system)`** under `<system>/`, sorted
@@ -735,23 +746,23 @@ shared progress-display primitive (`live::with_live`) that every phase animates
 through — is already done (§6); the executor is the part deferred until the
 cold-run wall-time justifies it.
 
-**Known gotcha (root-caused) — `nix-eval-jobs` restarts its worker after every
-job on macOS.** The ~100× darwin slowdown (measured ~1.5 attrs/s on an
-`aarch64-darwin` VM vs ~155 attrs/s on `aarch64-linux`, same hardware) is a
+**Resolved gotcha (root-caused) — `nix-eval-jobs` restarted its worker after
+every job on macOS.** The ~100× darwin slowdown (measured ~1.5 attrs/s on an
+`aarch64-darwin` VM vs ~155 attrs/s on `aarch64-linux`, same hardware) was a
 units bug in `nix-eval-jobs`' worker-restart check (`shouldRestart`,
-`src/worker.cc`): it compares `getrusage`'s `ru_maxrss` against
+`src/worker.cc`): it compared `getrusage`'s `ru_maxrss` against
 `--max-memory-size` (MiB) × 1024, which is correct on Linux (`ru_maxrss` in
 KiB) but off by 1024× on macOS (`ru_maxrss` in **bytes**). The effective cap
-becomes `--max-memory-size` *KiB*, every worker trips it after its first job,
-and each job pays a fork + full nixpkgs re-import (~0.6 s each; also why "huge"
-MB values didn't help — 999999 MB still reads as ~1 GB). It was never a GC or
+became `--max-memory-size` *KiB*, every worker tripped it after its first job,
+and each job paid a fork + full nixpkgs re-import (~0.6 s each; also why "huge"
+MB values didn't help — 999999 MB still read as ~1 GB). It was never a GC or
 eval-engine problem: with the cap compensated ×1024, the same darwin VM
-evaluates *faster* than the Linux VM (7671 vs 5134 attrs/30 s, one worker).
+evaluated *faster* than the Linux VM (7671 vs 5134 attrs/30 s, one worker).
 Reported as [nix-eval-jobs#425](https://github.com/NixOS/nix-eval-jobs/issues/425)
-and fixed by [nix-eval-jobs#426](https://github.com/NixOS/nix-eval-jobs/pull/426)
-(merged 2026-07-10). npd works around it by passing `--max-memory-size` ×1024 on
-macOS (see `stream_jobs` in `src/eval.rs`); drop that once the fix reaches the
-`nix-eval-jobs` npd runs.
+and fixed by [nix-eval-jobs#426](https://github.com/NixOS/nix-eval-jobs/pull/426).
+The flake pins a `nix-eval-jobs` that includes the fix (§4), so `stream_jobs`
+(`src/eval.rs`) now passes `--max-memory-size` unscaled on every platform — the
+former ×1024 macOS workaround is gone.
 
 ## 10. Resolved questions
 
