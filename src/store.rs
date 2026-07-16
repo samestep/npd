@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 -- `test_pkg` marks a package fully evaluated (present even when it has zero
 -- tests, so a no-test package isn't re-evaluated every run); `test_drv` holds
 -- each resolved `<pkg>.tests.<name>` drv (a package may contribute zero rows).
--- Full drv paths, like `observation`. `broken` is the test's own meta-blocked bit
+-- Full drv paths, like `observation`. `skipped` is the test's own meta-blocked bit
 -- (a test can be unsupported on this system even when its package builds — an
 -- x86-only NixOS test on aarch64), so it's stored per test, not inferred from the
 -- package.
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS test_drv (
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
-    broken    INTEGER NOT NULL,
+    skipped   INTEGER NOT NULL,
     PRIMARY KEY (tree, system, test_attr)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (tree, system, pkg_attr);
@@ -275,9 +275,9 @@ impl Store {
             if let Some(drv) = &j.drv_path {
                 tx.execute(
                     "INSERT OR REPLACE INTO test_drv \
-                     (tree, system, pkg_attr, test_attr, drv_path, broken) \
+                     (tree, system, pkg_attr, test_attr, drv_path, skipped) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![tree, system, j.pkg_attr, j.test_attr, drv, j.broken],
+                    params![tree, system, j.pkg_attr, j.test_attr, drv, j.skipped],
                 )?;
             }
         }
@@ -286,7 +286,7 @@ impl Store {
     }
 
     /// All cached test drvs for `pkgs` at this key, as `test_attr → (drv_path,
-    /// broken)` (only tests that resolved to a derivation). One query for the
+    /// skipped)` (only tests that resolved to a derivation). One query for the
     /// whole set.
     pub fn tests_drvs_for(
         &self,
@@ -300,7 +300,7 @@ impl Store {
         }
         let placeholders = placeholders(pkgs.len());
         let sql = format!(
-            "SELECT test_attr, drv_path, broken FROM test_drv \
+            "SELECT test_attr, drv_path, skipped FROM test_drv \
              WHERE tree = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -317,8 +317,8 @@ impl Store {
             ))
         })?;
         for row in rows {
-            let (test_attr, drv_path, broken) = row?;
-            out.insert(test_attr, (drv_path, broken));
+            let (test_attr, drv_path, skipped) = row?;
+            out.insert(test_attr, (drv_path, skipped));
         }
         Ok(out)
     }
@@ -432,26 +432,26 @@ mod tests {
                 .is_empty()
         );
 
-        // hello has two tests (one marked broken); ripgrep has none; one test
+        // hello has two tests (one skipped); ripgrep has none; one test
         // errored (no drv).
         let jobs = vec![
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.run".into(),
                 drv_path: Some("/nix/store/a.drv".into()),
-                broken: false,
+                skipped: false,
             },
             TestJob {
                 pkg_attr: "hello".into(),
                 test_attr: "hello.tests.version".into(),
                 drv_path: Some("/nix/store/b.drv".into()),
-                broken: true,
+                skipped: true,
             },
             TestJob {
                 pkg_attr: "hello".into(),
-                test_attr: "hello.tests.broken".into(),
+                test_attr: "hello.tests.err".into(),
                 drv_path: None,
-                broken: false,
+                skipped: false,
             },
         ];
         s.cache_test_eval(c, sys, &pkgs(&["hello", "ripgrep"]), &jobs)

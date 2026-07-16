@@ -21,10 +21,11 @@ pub enum State {
     Failed,
     /// A dependency failed, so this never ran (a transitive/cascade failure).
     Blocked,
-    /// Marked broken/unsupported/insecure in meta — not attempted by default
-    /// (like nixpkgs-review); `--build-broken` builds it anyway, and any real
-    /// build fact then outranks this state.
-    Broken,
+    /// Meta-blocked (broken/unsupported/insecure) — not attempted by default,
+    /// nixpkgs-review's "skipped" (its meta-blocked subset; a *missing* attr is
+    /// `Absent`, not this). `--no-skip` builds it anyway, and any real build
+    /// fact then outranks this state.
+    Skipped,
     /// No derivation on this side (the attr doesn't exist there).
     Absent,
     /// Has a derivation but no build fact yet (only reachable with `--no-build`).
@@ -37,7 +38,7 @@ impl State {
             State::Built => "✅",
             State::Failed => "❌",
             State::Blocked => "🚫",
-            State::Broken => "🚧",
+            State::Skipped => "⏩",
             State::Absent => "➖",
             State::Unknown => "❓",
         }
@@ -50,9 +51,9 @@ impl State {
 /// Local observations are ground truth and win over everything; a local success
 /// beats a local failure (it *can* build). A direct failure outranks a
 /// dependency failure (it's the more specific fact about this drv). Being
-/// marked broken only shows when no build fact exists — a package built anyway
-/// (`--build-broken`) reports its real outcome.
-pub fn side_state(drv: &Option<String>, broken: bool, obs: &[Observation]) -> State {
+/// meta-blocked (`Skipped`) only shows when no build fact exists — a package
+/// built anyway (`--no-skip`) reports its real outcome.
+pub fn side_state(drv: &Option<String>, skipped: bool, obs: &[Observation]) -> State {
     if drv.is_none() {
         return State::Absent;
     }
@@ -65,8 +66,8 @@ pub fn side_state(drv: &Option<String>, broken: bool, obs: &[Observation]) -> St
         State::Blocked
     } else if has(Source::Cache, Outcome::Built) {
         State::Built
-    } else if broken {
-        State::Broken
+    } else if skipped {
+        State::Skipped
     } else {
         State::Unknown
     }
@@ -86,11 +87,11 @@ pub struct Entry {
 /// phrase. Exhaustive over all 36 pairs — no catch-all — so adding a [`State`]
 /// forces every new pair to be placed deliberately.
 fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
-    use State::{Absent, Blocked, Broken, Built, Failed, Unknown};
+    use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
     // Nouns are singular count-nouns (pluralized with a trailing "s" by the
     // renderer), so the phrase, not the noun, carries the before→after detail.
-    // "Marked broken" is the umbrella for meta broken/unsupported/insecure;
-    // rows failing/building *from* Broken are only reachable via --build-broken.
+    // "Skipped" (meta-blocked: broken/unsupported/insecure) is nixpkgs-review's
+    // term; rows failing/building *from* Skipped are only reachable via --no-skip.
     match (base, head) {
         (Built, Failed) => (0, "regression", "build on the base, fail here"),
         (Built, Blocked) => (
@@ -106,11 +107,11 @@ fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
         ),
         (Unknown, Failed) => (4, "failure", "fail here; base status unknown"),
         (Unknown, Blocked) => (5, "blocked package", "blocked here; base status unknown"),
-        (Broken, Failed) => (6, "failure", "marked broken on the base, fail here"),
-        (Broken, Blocked) => (
+        (Skipped, Failed) => (6, "failure", "skipped on the base, fail here"),
+        (Skipped, Blocked) => (
             7,
             "blocked package",
-            "marked broken on the base, a dependency fails here",
+            "skipped on the base, a dependency fails here",
         ),
         (Failed, Failed) => (8, "pre-existing failure", "fail on the base and here"),
         (Failed, Blocked) => (9, "pre-existing failure", "fail on the base, blocked here"),
@@ -120,50 +121,50 @@ fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
             "pre-existing blocked package",
             "blocked on the base and here",
         ),
-        (Built, Broken) => (
+        (Built, Skipped) => (
             12,
-            "newly broken package",
-            "build on the base, marked broken here (not attempted)",
+            "newly skipped package",
+            "build on the base, skipped here (not attempted)",
         ),
-        (Failed, Broken) => (
+        (Failed, Skipped) => (
             13,
-            "newly broken package",
-            "fail on the base, marked broken here (not attempted)",
+            "newly skipped package",
+            "fail on the base, skipped here (not attempted)",
         ),
-        (Blocked, Broken) => (
+        (Blocked, Skipped) => (
             14,
-            "newly broken package",
-            "blocked on the base, marked broken here (not attempted)",
+            "newly skipped package",
+            "blocked on the base, skipped here (not attempted)",
         ),
-        (Absent, Broken) => (
+        (Absent, Skipped) => (
             15,
-            "new broken package",
-            "added here already marked broken (not attempted)",
+            "new skipped package",
+            "added here, already skipped (not attempted)",
         ),
-        (Unknown, Broken) => (
+        (Unknown, Skipped) => (
             16,
-            "broken package",
-            "marked broken here (not attempted); base status unknown",
+            "skipped package",
+            "skipped here (not attempted); base status unknown",
         ),
-        (Broken, Broken) => (
+        (Skipped, Skipped) => (
             17,
-            "pre-existing broken package",
-            "marked broken on the base and here (not attempted)",
+            "pre-existing skipped package",
+            "skipped on the base and here (not attempted)",
         ),
         (Built, Absent) => (18, "dropped package", "build on the base, gone here"),
         (Failed, Absent) => (19, "removed package", "failed on the base, gone here"),
         (Blocked, Absent) => (20, "removed package", "blocked on the base, gone here"),
-        (Broken, Absent) => (
+        (Skipped, Absent) => (
             21,
-            "removed broken package",
-            "marked broken on the base, gone here",
+            "removed skipped package",
+            "skipped on the base, gone here",
         ),
         (Failed, Built) => (22, "fixed package", "fail on the base, build here"),
         (Blocked, Built) => (23, "fixed package", "blocked on the base, build here"),
-        (Broken, Built) => (
+        (Skipped, Built) => (
             24,
-            "unbroken package",
-            "marked broken on the base, build here",
+            "newly enabled package",
+            "skipped on the base, build here",
         ),
         (Absent, Built) => (25, "new package", "new here, build"),
         (Unknown, Built) => (26, "built package", "build here; base status unknown"),
@@ -177,10 +178,10 @@ fn cell(base: State, head: State) -> (usize, &'static str, &'static str) {
             "unbuilt package",
             "blocked on the base; no fact here yet",
         ),
-        (Broken, Unknown) => (
+        (Skipped, Unknown) => (
             31,
             "unbuilt package",
-            "marked broken on the base; no fact here yet",
+            "skipped on the base; no fact here yet",
         ),
         (Absent, Unknown) => (32, "new unbuilt package", "added here; no fact yet"),
         (Unknown, Unknown) => (33, "unbuilt package", "no facts on either side yet"),
@@ -312,9 +313,9 @@ mod tests {
             ],
         );
         assert_eq!(s, State::Failed);
-        // Marked broken with no facts is Broken; a real fact (a --build-broken
+        // Meta-blocked with no facts is Skipped; a real fact (a --no-skip
         // run's build or failure) outranks the marking. No drv is still Absent.
-        assert_eq!(side_state(&d, true, &[]), State::Broken);
+        assert_eq!(side_state(&d, true, &[]), State::Skipped);
         assert_eq!(
             side_state(&d, true, &[obs(Source::Local, Outcome::Built)]),
             State::Built
@@ -330,8 +331,8 @@ mod tests {
     fn cell_priorities_are_distinct() {
         // Every (base, head) pair has its own section slot; a duplicate
         // priority would silently merge two sections' ordering.
-        use State::{Absent, Blocked, Broken, Built, Failed, Unknown};
-        const ALL: [State; 6] = [Built, Failed, Blocked, Broken, Absent, Unknown];
+        use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
+        const ALL: [State; 6] = [Built, Failed, Blocked, Skipped, Absent, Unknown];
         let mut seen = std::collections::HashSet::new();
         for b in ALL {
             for h in ALL {
@@ -379,11 +380,11 @@ mod tests {
                 Some("/b/d2"),
                 Some("/h/d2"),
             ),
-            // newly marked broken (meta), distinct from dep-blocked
+            // newly skipped (meta), distinct from dep-blocked
             entry(
                 "brk",
                 State::Built,
-                State::Broken,
+                State::Skipped,
                 Some("/b/k"),
                 Some("/h/k"),
             ),
@@ -409,7 +410,7 @@ mod tests {
         assert!(out.contains("✅ → ❌ · <b>1 regression</b>"), "{out}");
         assert!(out.contains("✅ → 🚫 · <b>2 blocked packages</b>"), "{out}");
         assert!(
-            out.contains("✅ → 🚧 · <b>1 newly broken package</b>"),
+            out.contains("✅ → ⏩ · <b>1 newly skipped package</b>"),
             "{out}"
         );
         // Grouping: shared drv collapses to one equals-joined line, shortest first.
@@ -422,10 +423,10 @@ mod tests {
         assert!(out.contains("<details><summary>✅ → ❌"), "{out}");
         assert!(out.contains("<details><summary>✅ → ✅"), "{out}");
         assert!(!out.contains("<details open>"), "{out}");
-        // Ordering: regression before blocked before newly-broken before unchanged.
+        // Ordering: regression before blocked before newly-skipped before unchanged.
         let reg = out.find("→ ❌").unwrap();
         let blk = out.find("→ 🚫").unwrap();
-        let brk = out.find("→ 🚧").unwrap();
+        let brk = out.find("→ ⏩").unwrap();
         let unch = out.find("✅ → ✅").unwrap();
         assert!(reg < blk && blk < brk && brk < unch, "{out}");
     }

@@ -81,11 +81,12 @@ struct Cli {
     /// from nixpkgs-review's `--tests` (#397).
     #[arg(long)]
     no_tests: bool,
-    /// Also build packages marked broken/unsupported/insecure (skipped and
-    /// reported as 🚧 by default, like nixpkgs-review).
+    /// Build the packages npd would otherwise skip — those marked
+    /// broken/unsupported/insecure in meta (reported as ⏩ by default, like
+    /// nixpkgs-review's "skipped").
     #[arg(long)]
-    build_broken: bool,
-    /// Everything on: implies --build-broken (tests are on by default).
+    no_skip: bool,
+    /// Everything on: implies --no-skip (tests are on by default).
     #[arg(long)]
     max: bool,
     /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
@@ -521,7 +522,7 @@ fn merge_source(repo: &std::path::Path, base: &Rev, head: &Rev) -> Result<Rev> {
 /// shares `ollama`'s drv but is marked unsupported), or a meta-only unmarking
 /// (a PR deleting `meta.broken` leaves the drv identical on both sides with
 /// the bit flipped). The marking is a property of the *attr*, not the recipe,
-/// so the deduped target is broken only if EVERY row wanting this drv is
+/// so the deduped target is skipped only if EVERY row wanting this drv is
 /// marked: any unmarked row is a legitimate request to build it.
 fn assemble_targets(
     per_system_changed: &[(String, Vec<evalfile::ChangedAttr>)],
@@ -530,19 +531,19 @@ fn assemble_targets(
     let mut index: HashMap<String, usize> = HashMap::new();
     for (_sys, changed) in per_system_changed {
         for c in changed {
-            let sides = [(&c.base_drv, c.base_broken), (&c.head_drv, c.head_broken)];
-            for (drv, broken) in sides {
+            let sides = [(&c.base_drv, c.base_skipped), (&c.head_drv, c.head_skipped)];
+            for (drv, skipped) in sides {
                 let Some(drv) = drv else { continue };
                 match index.entry(drv.clone()) {
                     Entry::Occupied(e) => {
                         let t = &mut targets[*e.get()];
-                        t.broken = t.broken && broken;
+                        t.skipped = t.skipped && skipped;
                     }
                     Entry::Vacant(e) => {
                         e.insert(targets.len());
                         targets.push(build::Target {
                             drv_path: drv.clone(),
-                            broken,
+                            skipped,
                         });
                     }
                 }
@@ -555,12 +556,12 @@ fn assemble_targets(
 fn run(cli: Cli) -> Result<()> {
     // Tests run by default; --no-tests opts out. --max is "everything on".
     let tests = !cli.no_tests;
-    let build_broken = cli.build_broken || cli.max;
+    let no_skip = cli.no_skip || cli.max;
     let policy = BuildPolicy {
         recheck: cli.recheck,
         retry: cli.retry,
         prefer_local: cli.prefer_local,
-        build_broken,
+        no_skip,
     };
     let opts = cli.eval;
     let repo = resolve_repo(cli.nixpkgs)?;
@@ -587,25 +588,25 @@ fn run(cli: Cli) -> Result<()> {
     // changed attr only when its drv actually differs base→head — exactly
     // `changed_set`'s own semantics, so the test rows classify (regression /
     // fixed / new / …) like every other attr. A side where the package is
-    // marked broken contributes no tests (a test drv depends on the package,
-    // so building it would build the broken package) unless --build-broken.
+    // skipped contributes no tests (a test drv depends on the package,
+    // so building it would build the skipped package) unless --no-skip.
     if tests {
         let mut store = store::Store::open(&paths::db_path()?)?;
-        // The unbroken changed-package names per system, on each side.
+        // The not-skipped changed-package names per system, on each side.
         let per_sys: Vec<(Vec<String>, Vec<String>)> = per_system_changed
             .iter()
             .map(|(_, changed)| {
-                let names_on = |unbroken: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
+                let names_on = |not_skipped: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
                     let mut v: Vec<String> = changed
                         .iter()
-                        .filter(|c| build_broken || unbroken(c))
+                        .filter(|c| no_skip || not_skipped(c))
                         .map(|c| c.attr.clone())
                         .collect();
                     v.sort();
                     v.dedup();
                     v
                 };
-                (names_on(|c| !c.base_broken), names_on(|c| !c.head_broken))
+                (names_on(|c| !c.base_skipped), names_on(|c| !c.head_skipped))
             })
             .collect();
 
@@ -651,7 +652,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // Build both sides of the changed set (skipping anything already known,
-    // substitutable, or marked broken) so the report has a real state for every
+    // substitutable, or meta-blocked) so the report has a real state for every
     // row, not a `❓`.
     if !cli.no_build {
         let targets = assemble_targets(&per_system_changed);
@@ -671,14 +672,14 @@ fn run(cli: Cli) -> Result<()> {
             let mut base_attrs = Vec::new();
             let mut head_attrs = Vec::new();
             for c in changed {
-                let wants = |drv: &Option<String>, broken: bool| {
+                let wants = |drv: &Option<String>, skipped: bool| {
                     drv.as_ref()
-                        .is_some_and(|d| (build_broken || !broken) && need.contains(d))
+                        .is_some_and(|d| (no_skip || !skipped) && need.contains(d))
                 };
-                if wants(&c.base_drv, c.base_broken) {
+                if wants(&c.base_drv, c.base_skipped) {
                     base_attrs.push(c.attr.clone());
                 }
-                if wants(&c.head_drv, c.head_broken) {
+                if wants(&c.head_drv, c.head_skipped) {
                     head_attrs.push(c.attr.clone());
                 }
             }
@@ -710,8 +711,8 @@ fn run(cli: Cli) -> Result<()> {
                 attr: c.attr.clone(),
                 base_drv: c.base_drv.clone(),
                 head_drv: c.head_drv.clone(),
-                base: report::side_state(&c.base_drv, c.base_broken, &base_obs),
-                head: report::side_state(&c.head_drv, c.head_broken, &head_obs),
+                base: report::side_state(&c.base_drv, c.base_skipped, &base_obs),
+                head: report::side_state(&c.head_drv, c.head_skipped, &head_obs),
             });
         }
         per_system.push((sys.clone(), entries));
@@ -732,20 +733,20 @@ mod tests {
         attr: &str,
         base_drv: Option<&str>,
         head_drv: Option<&str>,
-        base_broken: bool,
-        head_broken: bool,
+        base_skipped: bool,
+        head_skipped: bool,
     ) -> evalfile::ChangedAttr {
         evalfile::ChangedAttr {
             attr: attr.into(),
             base_drv: base_drv.map(str::to_string),
             head_drv: head_drv.map(str::to_string),
-            base_broken,
-            head_broken,
+            base_skipped,
+            head_skipped,
         }
     }
 
     #[test]
-    fn assemble_targets_dedups_and_ands_broken() {
+    fn assemble_targets_dedups_and_ands_skipped() {
         let changed = vec![
             // A meta-only unmarking: same drv both sides, bit flips — the
             // unmarked head side must win (build it).
@@ -755,25 +756,25 @@ mod tests {
             ca("tool", Some("/d/t0"), Some("/d/shared"), false, false),
             ca("tool-cuda", Some("/d/t1"), Some("/d/shared"), false, true),
             // Every alias marked ⇒ stays skipped.
-            ca("allbroken-a", None, Some("/d/ab"), false, true),
-            ca("allbroken-b", None, Some("/d/ab"), false, true),
+            ca("allskipped-a", None, Some("/d/ab"), false, true),
+            ca("allskipped-b", None, Some("/d/ab"), false, true),
         ];
         let targets = assemble_targets(&[("sys".into(), changed)]);
 
-        let broken_of = |drv: &str| {
+        let skipped_of = |drv: &str| {
             targets
                 .iter()
                 .find(|t| t.drv_path == drv)
                 .unwrap_or_else(|| panic!("no target for {drv}"))
-                .broken
+                .skipped
         };
         // Deduped: flip once, shared once, ab once, plus the two base drvs.
         assert_eq!(targets.len(), 5);
-        assert!(!broken_of("/d/flip"));
-        assert!(!broken_of("/d/shared"));
-        assert!(broken_of("/d/ab"));
-        assert!(!broken_of("/d/t0"));
-        assert!(!broken_of("/d/t1"));
+        assert!(!skipped_of("/d/flip"));
+        assert!(!skipped_of("/d/shared"));
+        assert!(skipped_of("/d/ab"));
+        assert!(!skipped_of("/d/t0"));
+        assert!(!skipped_of("/d/t1"));
     }
 
     /// Run git in `dir`, returning trimmed stdout; panics on failure.
@@ -1026,6 +1027,6 @@ mod tests {
         let b = vec![ca("x", None, Some("/d/x"), false, false)];
         let targets = assemble_targets(&[("sysA".into(), a), ("sysB".into(), b)]);
         assert_eq!(targets.len(), 1);
-        assert!(!targets[0].broken);
+        assert!(!targets[0].skipped);
     }
 }

@@ -6,8 +6,8 @@
 //! overhead; ~11 MB vs ~22 MB in SQLite) and lets us evict by whole file (drop
 //! old commits' evals) without vacuuming a monolithic DB. The format is one
 //! `attr\tdrv` line per attr, sorted by attr (empty drv = no derivation), plus a
-//! third field `b` on the few rows whose package is marked
-//! broken/unsupported/insecure, so the diff is a linear two-pointer merge.
+//! third field `!` on the few rows npd skips (meta-blocked:
+//! broken/unsupported/insecure), so the diff is a linear two-pointer merge.
 //!
 //! The drv column is stored *stripped*: `/nix/store/<h>-<n>.drv` is written as
 //! just `<h>-<n>` (see `strip_drv`), since that prefix/suffix is constant across
@@ -57,19 +57,19 @@ pub fn write_eval(path: &Path, attrs: &[AttrEval]) -> Result<()> {
             (
                 a.attr.as_str(),
                 a.drv_path.as_deref().map(strip_drv).unwrap_or(""),
-                a.broken,
+                a.skipped,
             )
         })
         .collect();
     rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut buf = String::with_capacity(rows.len() * 96);
-    for (attr, drv, broken) in rows {
+    for (attr, drv, skipped) in rows {
         buf.push_str(attr);
         buf.push('\t');
         buf.push_str(drv);
-        // A third field only on the (few) meta-blocked rows: `b`.
-        if broken {
-            buf.push_str("\tb");
+        // A third field only on the (few) skipped (meta-blocked) rows: `!`.
+        if skipped {
+            buf.push_str("\t!");
         }
         buf.push('\n');
     }
@@ -128,8 +128,8 @@ fn parse_line(l: &str) -> EvalRow<'_> {
     let mut fields = l.splitn(3, '\t');
     let attr = fields.next().unwrap_or(l);
     let drv = fields.next().unwrap_or("");
-    let broken = fields.next() == Some("b");
-    (attr, if drv.is_empty() { None } else { Some(drv) }, broken)
+    let skipped = fields.next() == Some("!");
+    (attr, if drv.is_empty() { None } else { Some(drv) }, skipped)
 }
 
 /// Parse a whole eval file's text into [`EvalRow`]s, borrowing from `buf`.
@@ -148,8 +148,8 @@ pub struct ChangedAttr {
     pub attr: String,
     pub base_drv: Option<String>,
     pub head_drv: Option<String>,
-    pub base_broken: bool,
-    pub head_broken: bool,
+    pub base_skipped: bool,
+    pub head_skipped: bool,
 }
 
 // The diff pipeline: each file is decompressed on its own thread (the two
@@ -317,8 +317,8 @@ fn base_only(r: &EvalRow) -> Option<ChangedAttr> {
         attr: r.0.to_string(),
         base_drv: restore_drv(r.1),
         head_drv: None,
-        base_broken: r.2,
-        head_broken: false,
+        base_skipped: r.2,
+        head_skipped: false,
     })
 }
 
@@ -328,14 +328,14 @@ fn head_only(r: &EvalRow) -> Option<ChangedAttr> {
         attr: r.0.to_string(),
         base_drv: None,
         head_drv: restore_drv(r.1),
-        base_broken: false,
-        head_broken: r.2,
+        base_skipped: false,
+        head_skipped: r.2,
     })
 }
 
 /// The changed rows between two attr-sorted sides: one [`ChangedAttr`] for
 /// each attr whose drv *or* meta-blocked bit differs (meta isn't part of the
-/// drv hash, so (un)marking a package broken can change nothing but the bit —
+/// drv hash, so (un)marking a package skipped can change nothing but the bit —
 /// still a review event worth a row), via a linear two-pointer merge. Only the
 /// (few) changed rows are allocated.
 fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<ChangedAttr>> {
@@ -356,8 +356,8 @@ fn merge_rows(mut b: impl RowCursor, mut h: impl RowCursor) -> Result<Vec<Change
                         attr: br.0.to_string(),
                         base_drv: restore_drv(br.1),
                         head_drv: restore_drv(hr.1),
-                        base_broken: br.2,
-                        head_broken: hr.2,
+                        base_skipped: br.2,
+                        head_skipped: hr.2,
                     });
                     (emit, true, true)
                 }
@@ -405,7 +405,7 @@ fn diff(b: &[EvalRow], h: &[EvalRow]) -> Vec<ChangedAttr> {
         .expect("slice cursors are infallible")
 }
 
-/// Diff two `test_attr → (drv, broken)` maps (the `--tests` cache's shape, full
+/// Diff two `test_attr → (drv, skipped)` maps (the `--tests` cache's shape, full
 /// drv paths) with exactly [`diff`]'s semantics, so test rows classify
 /// (regression / fixed / new / meta-only …) like any full-set attr.
 pub fn changed_tests(
@@ -415,7 +415,7 @@ pub fn changed_tests(
     fn rows(m: &std::collections::HashMap<String, (String, bool)>) -> Vec<EvalRow<'_>> {
         let mut v: Vec<EvalRow<'_>> = m
             .iter()
-            .map(|(attr, (drv, broken))| (attr.as_str(), Some(strip_drv(drv)), *broken))
+            .map(|(attr, (drv, skipped))| (attr.as_str(), Some(strip_drv(drv)), *skipped))
             .collect();
         v.sort_unstable_by_key(|r| r.0);
         v
@@ -445,10 +445,10 @@ mod tests {
 
     #[test]
     fn write_eval_strips_and_parse_restores() {
-        let ae = |attr: &str, drv: Option<&str>, broken: bool| AttrEval {
+        let ae = |attr: &str, drv: Option<&str>, skipped: bool| AttrEval {
             attr: attr.into(),
             drv_path: drv.map(str::to_string),
-            broken,
+            skipped,
         };
         let attrs = [
             ae("hello", Some("/nix/store/a-hello.drv"), false),
@@ -461,11 +461,11 @@ mod tests {
         write_eval(&path, &attrs).unwrap();
 
         // On disk the drv is stripped; a no-derivation attr is an empty field;
-        // only the meta-blocked row carries the third `b` field (sorted by attr:
+        // only the skipped row carries the third `!` field (sorted by attr:
         // bad, br, hello). The file is zstd-compressed, so read it back through
         // the same helper the diff uses.
         let raw = read_eval(&path).unwrap();
-        assert_eq!(raw, "bad\t\nbr\tb-br\tb\nhello\ta-hello\n");
+        assert_eq!(raw, "bad\t\nbr\tb-br\t!\nhello\ta-hello\n");
 
         // Parsing + restoring recovers the original rows exactly.
         let parsed = parse_eval(&raw);
@@ -490,15 +490,15 @@ mod tests {
         attr: &str,
         base: Option<&str>,
         head: Option<&str>,
-        base_broken: bool,
-        head_broken: bool,
+        base_skipped: bool,
+        head_skipped: bool,
     ) -> ChangedAttr {
         ChangedAttr {
             attr: attr.into(),
             base_drv: restore_drv(base),
             head_drv: restore_drv(head),
-            base_broken,
-            head_broken,
+            base_skipped,
+            head_skipped,
         }
     }
 
@@ -552,10 +552,10 @@ mod tests {
         // End-to-end over the real on-disk shape: write two evals with
         // write_eval, diff them through the streaming path (decoder threads +
         // line cursors), and expect exactly diff's semantics.
-        let ae = |attr: &str, drv: Option<&str>, broken: bool| AttrEval {
+        let ae = |attr: &str, drv: Option<&str>, skipped: bool| AttrEval {
             attr: attr.into(),
             drv_path: drv.map(str::to_string),
-            broken,
+            skipped,
         };
         let dir = std::env::temp_dir().join(format!("npd-stream-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

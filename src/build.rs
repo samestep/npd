@@ -37,9 +37,9 @@ use crate::store::Store;
 /// or a diff's changed set.
 pub struct Target {
     pub drv_path: String,
-    /// Marked broken/unsupported/insecure in meta — skipped by the default
-    /// policy (`BuildPolicy::build_broken` overrides).
-    pub broken: bool,
+    /// Meta-blocked (broken/unsupported/insecure) — skipped by the default
+    /// policy (`BuildPolicy::no_skip` overrides).
+    pub skipped: bool,
 }
 
 /// Seconds since the Unix epoch, for an observation's `when` stamp.
@@ -356,7 +356,7 @@ fn drvs_to_materialize_at(
             .any(|o| o.source == Source::Cache && o.outcome == Outcome::Built);
         let substitutable = !force && cache_built;
         let dep_stale = stale.get(&t.drv_path).copied().unwrap_or(false);
-        if policy.decide(obs, substitutable, t.broken, dep_stale) == Decision::Build {
+        if policy.decide(obs, substitutable, t.skipped, dep_stale) == Decision::Build {
             need.insert(t.drv_path.clone());
         }
     }
@@ -391,12 +391,12 @@ fn probe_new_facts(store: &mut Store, targets: &[Target], policy: BuildPolicy) -
             })
         })
     };
-    // A broken target the policy will skip anyway isn't worth an HTTP probe.
-    let skipped_broken = |t: &Target| t.broken && !policy.build_broken;
+    // A target the policy will skip anyway isn't worth an HTTP probe.
+    let will_skip = |t: &Target| t.skipped && !policy.no_skip;
     let mut to_probe: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
     for t in targets {
-        if !has_fact(&t.drv_path) && !skipped_broken(t) && seen.insert(t.drv_path.clone()) {
+        if !has_fact(&t.drv_path) && !will_skip(t) && seen.insert(t.drv_path.clone()) {
             to_probe.push(t.drv_path.clone());
         }
     }
@@ -477,7 +477,7 @@ fn build_targets_at(db: &std::path::Path, targets: &[Target], policy: BuildPolic
         let decision = policy.decide(
             observations,
             substitutable(&t.drv_path),
-            t.broken,
+            t.skipped,
             dep_stale(&t.drv_path),
         );
         if decision == Decision::Build {
@@ -673,10 +673,10 @@ mod tests {
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    fn target(drv: &str, broken: bool) -> Target {
+    fn target(drv: &str, skipped: bool) -> Target {
         Target {
             drv_path: drv.into(),
-            broken,
+            skipped,
         }
     }
 
@@ -719,20 +719,20 @@ mod tests {
             s.add_observation(&planted("/d/failed", Source::Local, Outcome::Failed))
                 .unwrap();
         }
-        // "/d/new" has no fact; "/d/broken" is meta-blocked.
+        // "/d/new" has no fact; "/d/skipped" is meta-blocked.
         let targets = vec![
             target("/d/built", false),
             target("/d/cached", false),
             target("/d/failed", false),
-            target("/d/broken", true),
+            target("/d/skipped", true),
             target("/d/new", false),
         ];
 
-        // Default policy: only the never-observed, non-broken drv needs a `.drv`.
+        // Default policy: only the never-observed, non-skipped drv needs a `.drv`.
         let need = drvs_to_materialize_at(&db, &targets, BuildPolicy::default()).unwrap();
         assert_eq!(need, HashSet::from(["/d/new".to_string()]));
 
-        // A fully-cached set (drop the new/broken outliers) needs nothing — the
+        // A fully-cached set (drop the new/skipped outliers) needs nothing — the
         // instantiation eval is skipped entirely.
         let cached_only = &targets[..3];
         assert!(
@@ -742,8 +742,8 @@ mod tests {
         );
 
         // The cache-bypass knobs re-open their targets: --recheck a success,
-        // --retry a failure, --prefer-local a substitutable, --build-broken a
-        // marked one — each then needs its `.drv` again.
+        // --retry a failure, --prefer-local a substitutable, --no-skip a
+        // meta-blocked one — each then needs its `.drv` again.
         let recheck = BuildPolicy {
             recheck: true,
             ..Default::default()
@@ -771,14 +771,14 @@ mod tests {
                 .unwrap()
                 .contains("/d/cached")
         );
-        let build_broken = BuildPolicy {
-            build_broken: true,
+        let no_skip = BuildPolicy {
+            no_skip: true,
             ..Default::default()
         };
         assert!(
-            drvs_to_materialize_at(&db, &targets, build_broken)
+            drvs_to_materialize_at(&db, &targets, no_skip)
                 .unwrap()
-                .contains("/d/broken")
+                .contains("/d/skipped")
         );
     }
 
@@ -836,7 +836,7 @@ mod tests {
             .into_iter()
             .map(|drv| Target {
                 drv_path: drv.clone(),
-                broken: false,
+                skipped: false,
             })
             .collect();
         let db2 = db.clone();
@@ -916,7 +916,7 @@ mod tests {
 
         let targets = [Target {
             drv_path: top.clone(),
-            broken: false,
+            skipped: false,
         }];
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
 
@@ -980,7 +980,7 @@ mod tests {
 
         let targets = [Target {
             drv_path: top.clone(),
-            broken: false,
+            skipped: false,
         }];
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();
 
@@ -1062,7 +1062,7 @@ mod tests {
 
         let targets = [Target {
             drv_path: top.clone(),
-            broken: false,
+            skipped: false,
         }];
         // Default policy — no --retry. The stale block alone must re-open `top`.
         build_targets_at(&db, &targets, BuildPolicy::default()).unwrap();

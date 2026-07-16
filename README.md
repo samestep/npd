@@ -44,17 +44,17 @@ shorthand for the PR's head merged onto its base branch (reusing GitHub's
 test-merge commit; no API/token). `--no-merge` opts back into the older
 `merge-base → head` fork-point diff (offline, but blind to base drift).
 It **builds whatever the states need** first (both sides of the changed set,
-skipping anything already known, substitutable, or marked
-broken/unsupported/insecure — the latter reported as 🚧, like nixpkgs-review),
-then groups the result by its `before → after` delta (regression /
-blocked-by-a-regression / newly-marked-broken / fixed / dropped / …), folded,
-with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
+skipping anything already known, substitutable, or meta-blocked
+(broken/unsupported/insecure) — the last reported as ⏩ **skipped**, npd's name
+for what nixpkgs-review skips), then groups the result by its `before → after`
+delta (regression / blocked-by-a-regression / newly-skipped / fixed / dropped /
+…), folded, with drv-sharing attrs collapsed (`a = b = c`). Flags: `--no-build`
 (render from existing facts only), `--recheck` / `--retry` / `--prefer-local`
 (build-policy knobs), `--no-tests` (skip each changed package's
 `passthru.tests`, built on both sides by default — ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397)),
-`--build-broken` (build meta-blocked packages too), `--max` (everything on:
-implies `--build-broken`; tests are on by default),
+`--no-skip` (build the meta-blocked packages npd otherwise skips), `--max`
+(everything on: implies `--no-skip`; tests are on by default),
 `--system` (repeatable), `--nixpkgs`, and sizing knobs for the parallel
 evaluator (`--eval-slots`, `--worker-mem-mb`). Under the hood: evals cached
 as flat per-commit files (diffed by a streaming linear merge), a tiny SQLite

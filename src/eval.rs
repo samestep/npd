@@ -61,11 +61,12 @@ struct RawJob {
     meta: Option<RawMeta>,
 }
 
-/// Fold `--meta`'s availability bits into npd's single "meta-blocked" bit: marked
-/// broken *or* unsupported-on-this-system *or* insecure. A missing `meta` (an
-/// errored attr carries none) reads as not-blocked. Shared by the full-set walk
-/// and the targeted test eval so both classify meta the same way.
-fn meta_broken(meta: &RawMeta) -> bool {
+/// Fold `--meta`'s availability bits into npd's single "skipped" bit (its
+/// meta-blocked analogue of nixpkgs-review's "skipped"): marked broken *or*
+/// unsupported-on-this-system *or* insecure. A missing `meta` (an errored attr
+/// carries none) reads as not-skipped. Shared by the full-set walk and the
+/// targeted test eval so both classify meta the same way.
+fn meta_skipped(meta: &RawMeta) -> bool {
     meta.broken == Some(true) || meta.unsupported == Some(true) || meta.insecure == Some(true)
 }
 
@@ -73,7 +74,7 @@ fn raw_to_attr_eval(raw: RawJob) -> AttrEval {
     AttrEval {
         attr: raw.attr,
         drv_path: raw.drv_path,
-        broken: meta_broken(&raw.meta.unwrap_or_default()),
+        skipped: meta_skipped(&raw.meta.unwrap_or_default()),
     }
 }
 
@@ -86,7 +87,7 @@ fn raw_to_test_job(raw: RawJob) -> TestJob {
     TestJob {
         pkg_attr: raw.attr_path.first().cloned().unwrap_or_default(),
         test_attr: raw.attr_path.join("."),
-        broken: meta_broken(&raw.meta.unwrap_or_default()),
+        skipped: meta_skipped(&raw.meta.unwrap_or_default()),
         drv_path: raw.drv_path,
     }
 }
@@ -313,7 +314,7 @@ fn stream_jobs<T>(
 /// meta-blocked. `mark` computes it here — platform support via
 /// `lib.meta.availableOn`, insecurity via `knownVulnerabilities` — and injects
 /// `unsupported`/`insecure` into each test derivation's `meta`, so the same fold
-/// the full-set walk uses (`meta_broken`) also classifies tests, matching
+/// the full-set walk uses (`meta_skipped`) also classifies tests, matching
 /// nixpkgs-review's "marked broken and skipped" (which gets the same answer by
 /// `tryEval`-ing the outPath under a strict config). `mark` stops at
 /// derivations, so it never forces a derivation's internals, and each recursed
@@ -1123,8 +1124,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_success_broken_and_error_lines() {
-        // Any of meta.broken/unsupported/insecure folds into the one `broken`
+    fn parses_success_skipped_and_error_lines() {
+        // Any of meta.broken/unsupported/insecure folds into the one `skipped`
         // bit; an errored attr has no drvPath (and no meta). Unknown fields
         // (system, fatal, …) are simply ignored.
         let stdout = concat!(
@@ -1142,15 +1143,15 @@ mod tests {
 
         assert_eq!(attrs[0].attr, "hello");
         assert_eq!(attrs[0].drv_path.as_deref(), Some("/nix/store/a-hello.drv"));
-        assert!(!attrs[0].broken);
+        assert!(!attrs[0].skipped);
 
-        assert!(attrs[1].broken);
+        assert!(attrs[1].skipped);
         assert!(attrs[1].drv_path.is_some());
-        assert!(attrs[2].broken);
+        assert!(attrs[2].skipped);
 
         assert_eq!(attrs[3].attr, "bad");
         assert_eq!(attrs[3].drv_path, None);
-        assert!(!attrs[3].broken);
+        assert!(!attrs[3].skipped);
     }
 
     #[test]

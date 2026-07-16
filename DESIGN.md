@@ -109,8 +109,8 @@ again, Nix rebuilds or substitutes it.
 The two fact kinds have opposite access patterns, so they get different backends.
 
 **Evals → one flat file per `(tree, system)`** under `<system>/`, sorted
-`attr\tdrv` lines (empty drv = no derivation; a third field `b` marks the few
-attrs whose meta says broken/unsupported/insecure; `src/eval.rs`). The drv is stored
+`attr\tdrv` lines (empty drv = no derivation; a third field `!` marks the few
+attrs npd skips — meta broken/unsupported/insecure; `src/eval.rs`). The drv is stored
 stripped of its constant `/nix/store/…​.drv` prefix/suffix, and the whole file is
 zstd-compressed (default level) — together ~3× smaller (~11 MB → ~3.4 MB). An eval is bulk,
 write-once, read-as-a-whole data whose *only* use is to be diffed against another
@@ -161,22 +161,27 @@ Every local build appends an `Observation` (source, outcome, when). The
 ergonomics the workflow needs are then a **pure predicate**
 over that log plus substituter presence:
 
-- marked broken/unsupported/insecure, `--build-broken` off → **skip (broken)**
-  — never attempted, like nixpkgs-review; the report shows 🚧. (Checked first,
+- meta-blocked (broken/unsupported/insecure), `--no-skip` off → **skipped**
+  — never attempted, like nixpkgs-review; the report shows ⏩. (Checked first,
   so `--retry`/`--recheck` alone don't build it; a real fact recorded by an
-  earlier `--build-broken` run still wins.)
+  earlier `--no-skip` run still wins.)
 - never observed, or forced → **build**
 - a `LOCAL` success exists, `--recheck` off → **skip (ok)**
 - substitutable success, `--prefer-local`/`--recheck` off → **skip (ok)**
 - only failures observed, `--retry` off → **skip (fail)**
 - otherwise → **build**
 
+("Skipped" is npd's name for what nixpkgs-review calls skipped — its
+meta-blocked subset; a *missing* attr is a separate state, ➖ absent. The
+cache-skips above — `skip (ok)`/`skip (fail)` — are not that state: they still
+render as the real built/failed outcome.)
+
 So the cache-bypass knobs are just fields on the policy: `recheck` (rebuild a
 suspected-flaky success), `retry` (re-attempt a known failure), `prefer_local`
-(don't trust a substituted success — build it here), `build_broken` (attempt
-meta-blocked packages too). See `BuildPolicy::decide` in `src/model.rs`.
-`--max` at the CLI is simply everything on: `--build-broken` (tests run by
-default; `--no-tests` opts out).
+(don't trust a substituted success — build it here), `no_skip` (build the
+meta-blocked packages npd otherwise skips). See `BuildPolicy::decide` in
+`src/model.rs`. `--max` at the CLI is simply everything on: `--no-skip` (tests
+run by default; `--no-tests` opts out).
 
 **Staying instant when cached.** The driver loads every target's history in one
 SQLite query, and only *probes the cache* for drvs it doesn't already know are
@@ -390,10 +395,10 @@ environment (`SHELL` removed, so `getEnv` yields `""`, matching a hermetic
 eval) — the cache key stays honest without hashing the environment.
 
 `eval(commit, system)` → `{attr: AttrEval}` via `nix-eval-jobs --meta` (cached,
-pure). Each attr carries its drv plus one meta bit — marked
-broken/unsupported/insecure — since meta is *not* part of the drv hash, so the
+pure). Each attr carries its drv plus one meta bit — the **skipped** flag (meta
+broken/unsupported/insecure) — since meta is *not* part of the drv hash, so the
 build policy and report can't recover it from the drv alone. The diff is a
-set-diff on `(attr, drv_path, broken)` — a meta-only (un)marking changes no
+set-diff on `(attr, drv_path, skipped)` — a meta-only (un)marking changes no
 drv but is still a review event and gets a row. (An earlier design also
 sketched a *three-way* diff against the merge base, classifying each changed
 attr as changed-by-this-side / by-the-other / by-both; it turned out not to
@@ -502,11 +507,11 @@ to carry — so the tests expression **computes** the bit itself (platform suppo
 via `lib.meta.availableOn`, insecurity via `knownVulnerabilities`) and injects it
 into each test's meta (`build_tests_expr` in `src/eval.rs`). This lands the same
 verdict nixpkgs-review reaches by `tryEval`-ing the outPath under a strict
-config: a meta-blocked test is skipped and rendered 🚧, exactly as nixpkgs-review
+config: a meta-blocked test is skipped and rendered ⏩, exactly as nixpkgs-review
 lists it under "marked broken and skipped". npd evaluates the tests on **both**
-sides and keeps a test only where its `(drv, broken)` pair actually differs
+sides and keeps a test only where its `(drv, skipped)` pair actually differs
 base→head, so the resulting rows classify (regression / fixed / new /
-marked-broken / …) exactly like any other attr — a delta view, a superset of
+skipped / …) exactly like any other attr — a delta view, a superset of
 #397's one-shot head-only build.
 
 This eval **is cached**, but *per package* rather than as a whole-set file. A
@@ -567,9 +572,10 @@ can change under us). Ground truth for anything a narinfo can't answer is a
 
 Markdown, grouped by the **delta** each attr underwent. Each side reduces to one
 of six states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependency
-failed — the transitive/cascade case, kept distinct from a direct failure), `🚧`
-marked broken (meta broken/unsupported/insecure — not attempted by default; a
-real build fact from a `--build-broken` run outranks the marking), `➖`
+failed — the transitive/cascade case, kept distinct from a direct failure), `⏩`
+skipped (meta-blocked: broken/unsupported/insecure — not attempted by default,
+like nixpkgs-review; a real build fact from a `--no-skip` run outranks the
+marking; a *missing* attr is `➖` absent, not this), `➖`
 absent (no such attr on that side, or it no longer evaluates — a *known* fact,
 never a `?`; in a delta view an eval breakage is visible as disappearance, so
 there is no separate eval-error state), `❓` unbuilt

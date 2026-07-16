@@ -48,15 +48,17 @@ pub struct Rev {
 /// from a *build* failure, which is an [`Observation`]. The diff and report
 /// deliberately render an errored attr as *absent* (➖): in a delta view an
 /// eval breakage is visible as the attr disappearing, so no separate error
-/// state is needed. `broken` folds
-/// `meta.broken` / `meta.unsupported` / `meta.insecure` into one bit: the
-/// profile's allow-flags let such a package evaluate to a drv anyway, but by
-/// default it is not *built* (like nixpkgs-review) — see [`BuildPolicy`].
+/// state is needed. `skipped` folds
+/// `meta.broken` / `meta.unsupported` / `meta.insecure` into one bit — npd's
+/// analogue of nixpkgs-review's "skipped" (its meta-blocked subset; a *missing*
+/// attr is a separate state, ➖ absent): the profile's allow-flags let such a
+/// package evaluate to a drv anyway, but by default it is not *built* (like
+/// nixpkgs-review) — see [`BuildPolicy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrEval {
     pub attr: String,
     pub drv_path: Option<String>,
-    pub broken: bool,
+    pub skipped: bool,
 }
 
 /// One resolved `passthru.tests` entry from a targeted test eval (`--tests`).
@@ -65,7 +67,7 @@ pub struct AttrEval {
 /// `pkg_attr` is the package the test hangs off (the attr-path's first element),
 /// `test_attr` is the full `<pkg>.tests.<name>` label, and `drv_path` is `None`
 /// when the test errored (no derivation) — the same shape the full-set walk gives
-/// an errored attr. `broken` is the test's own meta-blocked bit (broken /
+/// an errored attr. `skipped` is the test's own meta-blocked bit (broken /
 /// unsupported-on-this-system / insecure) — a test can be unavailable even when
 /// its package is fine (e.g. an x86-only NixOS test hung off a cross-platform
 /// package on `aarch64-linux`), so it must be tracked per test, not inferred from
@@ -75,7 +77,7 @@ pub struct TestJob {
     pub pkg_attr: String,
     pub test_attr: String,
     pub drv_path: Option<String>,
-    pub broken: bool,
+    pub skipped: bool,
 }
 
 /// Where a build observation came from. Local builds and substituter presence
@@ -131,9 +133,10 @@ pub enum Decision {
     SkipOk,
     /// Only failures observed — don't waste time (unless `retry`).
     SkipFail,
-    /// Marked broken/unsupported/insecure and `build_broken` is off — not
-    /// attempted (like nixpkgs-review); the report shows it as 🚧.
-    SkipBroken,
+    /// Meta-blocked (broken/unsupported/insecure) and `no_skip` is off — not
+    /// attempted (like nixpkgs-review); the report shows it as ⏩ (nixpkgs-review's
+    /// "skipped").
+    Skipped,
 }
 
 /// Turns a derivation's observation history into an action.
@@ -149,9 +152,9 @@ pub struct BuildPolicy {
     pub retry: bool,
     /// Ignore a substitutable (cached) success; require a genuine local build.
     pub prefer_local: bool,
-    /// Also build packages marked broken/unsupported/insecure (skipped by
-    /// default, like nixpkgs-review).
-    pub build_broken: bool,
+    /// Build the packages npd would otherwise skip for being meta-blocked
+    /// (broken/unsupported/insecure) — off by default, like nixpkgs-review.
+    pub no_skip: bool,
 }
 
 impl BuildPolicy {
@@ -159,8 +162,8 @@ impl BuildPolicy {
     ///
     /// `substitutable` means a successful output is available from a substituter
     /// (Nix could fetch it without building) — a *success* signal that says
-    /// nothing about local reproducibility. `broken` is the attr's
-    /// meta-broken/unsupported/insecure bit from the eval.
+    /// nothing about local reproducibility. `skipped` is the attr's
+    /// meta-blocked (broken/unsupported/insecure) bit from the eval.
     ///
     /// `dep_block_stale` distinguishes the two kinds of recorded failure
     /// (DESIGN.md §5). A **direct** failure (the drv's own build failed) is
@@ -175,7 +178,7 @@ impl BuildPolicy {
         &self,
         observations: &[Observation],
         substitutable: bool,
-        broken: bool,
+        skipped: bool,
         dep_block_stale: bool,
     ) -> Decision {
         let local: Vec<&Observation> = observations
@@ -186,14 +189,14 @@ impl BuildPolicy {
         let direct_failed = local.iter().any(|o| o.outcome == Outcome::Failed);
         let dep_failed = local.iter().any(|o| o.outcome == Outcome::DepFailed);
 
-        // Marked broken and not overridden: never attempt (checked before the
+        // Meta-blocked and not overridden: never attempt (checked before the
         // other knobs, so e.g. `--retry` alone still doesn't build it). A real
-        // fact recorded earlier (a prior `--build-broken` run) still counts.
-        if broken && !self.build_broken {
+        // fact recorded earlier (a prior `--no-skip` run) still counts.
+        if skipped && !self.no_skip {
             return if local_built {
                 Decision::SkipOk
             } else {
-                Decision::SkipBroken
+                Decision::Skipped
             };
         }
         // A trusted success short-circuits unless we're deliberately re-checking.
@@ -341,39 +344,36 @@ mod tests {
     }
 
     #[test]
-    fn broken_skips_unless_build_broken() {
-        // Marked broken: never attempted by default — not even when
+    fn skipped_stays_skipped_unless_no_skip() {
+        // Meta-blocked: never attempted by default — not even when
         // substitutable, and not under --retry/--recheck alone.
         let p = BuildPolicy::default();
-        assert_eq!(p.decide(&[], false, true, false), Decision::SkipBroken);
-        assert_eq!(p.decide(&[], true, true, false), Decision::SkipBroken);
+        assert_eq!(p.decide(&[], false, true, false), Decision::Skipped);
+        assert_eq!(p.decide(&[], true, true, false), Decision::Skipped);
         let retry = BuildPolicy {
             retry: true,
             ..Default::default()
         };
         assert_eq!(
             retry.decide(&[obs(Source::Local, Outcome::Failed)], false, true, false),
-            Decision::SkipBroken
+            Decision::Skipped
         );
         let recheck = BuildPolicy {
             recheck: true,
             ..Default::default()
         };
-        assert_eq!(
-            recheck.decide(&[], false, true, false),
-            Decision::SkipBroken
-        );
+        assert_eq!(recheck.decide(&[], false, true, false), Decision::Skipped);
 
         // A prior forced build's success is still a trusted fact.
         let o = [obs(Source::Local, Outcome::Built)];
         assert_eq!(p.decide(&o, false, true, false), Decision::SkipOk);
 
-        // --build-broken restores the normal policy.
-        let bb = BuildPolicy {
-            build_broken: true,
+        // --no-skip restores the normal policy.
+        let ns = BuildPolicy {
+            no_skip: true,
             ..Default::default()
         };
-        assert_eq!(bb.decide(&[], false, true, false), Decision::Build);
-        assert_eq!(bb.decide(&o, false, true, false), Decision::SkipOk);
+        assert_eq!(ns.decide(&[], false, true, false), Decision::Build);
+        assert_eq!(ns.decide(&o, false, true, false), Decision::SkipOk);
     }
 }
