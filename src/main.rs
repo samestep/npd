@@ -33,6 +33,8 @@ use crate::model::{BuildPolicy, Rev};
 )]
 struct Cli {
     /// nixpkgs clone to resolve the commits in (default: current directory).
+    /// Like git's `-C`, a relative `--patch` file path resolves against this
+    /// directory too.
     #[arg(short = 'C')]
     path: Option<PathBuf>,
     /// Base-branch tip to review the head against (default: `master`). The
@@ -43,12 +45,15 @@ struct Cli {
     /// tree if it has changes).
     #[arg(long, conflicts_with = "pr")]
     head: Option<String>,
-    /// Review a diff applied on top of the head (`--head`, else `HEAD`), instead
-    /// of a plain revision — the head becomes a synthetic content-addressed
-    /// commit (like the uncommitted-working-tree capture). The value is either a
-    /// **path** to a diff file (Nix path syntax: it must contain a `/`, so use
-    /// `./x.diff` for the current directory) or a GitHub **compare expression**
-    /// `A...B`, which npd fetches from `NixOS/nixpkgs` as `compare/A...B.diff`.
+    /// Review a diff applied on top of an anchor, instead of a plain revision —
+    /// the head becomes a synthetic content-addressed commit (like the
+    /// uncommitted-working-tree capture). The anchor is `--head` if given, else
+    /// the default head — the working tree if it has uncommitted changes, else
+    /// `HEAD` — so `--patch` composes with work in progress; pass `--head HEAD` to
+    /// apply onto the committed tree instead. The value is either a **path** to a
+    /// diff file (Nix path syntax: it must contain a `/`, so use `./x.diff`;
+    /// resolved against `-C`) or a GitHub **compare expression** `A...B`, whose
+    /// endpoints npd resolves locally to shas and fetches as `compare/A...B.diff`.
     /// This is what a report's reproduction command uses to rebuild a PR head
     /// (durably, past the force-pushes PRs rebase through) or an uncommitted
     /// working tree, without needing the original commit fetchable.
@@ -315,6 +320,15 @@ fn git_diff_binary(repo: &std::path::Path, a: &str, b: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
+/// Whether `git diff A B` touches any binary file. `--numstat` prints
+/// `added\tdeleted\tpath` per file, with `-\t-` for a binary one — the signal
+/// that GitHub's text `.diff` couldn't carry the change, so the reproduction
+/// command must embed a `--binary` diff rather than a compare expression.
+fn diff_has_binary(repo: &std::path::Path, a: &str, b: &str) -> Result<bool> {
+    let out = git(repo, &["diff", "--numstat", a, b])?;
+    Ok(out.lines().any(|l| l.starts_with("-\t-\t")))
+}
+
 /// The tree object a commit points at — the eval cache key (see [`Rev`]).
 fn tree_of(repo: &std::path::Path, commit: &str) -> Result<String> {
     git(repo, &["rev-parse", &format!("{commit}^{{tree}}")])
@@ -501,8 +515,10 @@ fn resolve_local(
     patch: Option<&str>,
 ) -> Result<(Rev, Rev)> {
     let head = match (head, patch) {
-        // --patch: the head is the given diff applied on top of the anchor
-        // (`--head`, else `HEAD`) — a synthetic content-addressed commit.
+        // --patch: the head is the given diff applied on top of the anchor commit
+        // (resolved by the caller — an explicit `--head`, else the default head,
+        // which may be the working tree), yielding a synthetic content-addressed
+        // commit.
         (anchor, Some(diff)) => patch_source(repo, anchor.as_deref().unwrap_or("HEAD"), diff)?,
         (Some(h), None) => commit_source(repo, resolve_commit(repo, &h)?)?,
         (None, None) => head_source(repo)?,
@@ -746,10 +762,21 @@ fn run(cli: Cli) -> Result<()> {
     let mut patch_compare: Option<String> = None;
     let patch_diff: Option<String> = match &cli.patch {
         None => None,
-        Some(value) if value.contains('/') => Some(
-            std::fs::read_to_string(value)
-                .with_context(|| format!("reading the --patch file {value}"))?,
-        ),
+        Some(value) if value.contains('/') => {
+            // A relative diff path resolves against the `-C` directory, like
+            // git's own `-C` (which npd's flag mirrors) — not npd's process cwd.
+            // A default run (no `-C`) has `repo` == cwd, so this is a no-op there.
+            let p = std::path::Path::new(value);
+            let p = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                repo.join(p)
+            };
+            Some(
+                std::fs::read_to_string(&p)
+                    .with_context(|| format!("reading the --patch file {}", p.display()))?,
+            )
+        }
         Some(value) if value.contains("...") => {
             let expr = pin_compare(&repo, value)?;
             let diff = fetch_compare_diff(&expr)?;
@@ -762,18 +789,20 @@ fn run(cli: Cli) -> Result<()> {
         ),
     };
 
-    // Resolve the --patch anchor (`--head`, else `HEAD`) to an immutable sha
-    // *once*, here, and thread that sha everywhere the run needs it (building the
-    // head, and the reproduction command). Resolving a mutable ref more than once
-    // in a single run risks it moving between lookups — the head we review and
-    // the anchor we later print could then disagree. A full sha, by contrast, is
-    // content-addressed: `resolve_commit` on it downstream is idempotent, so it
-    // can never diverge.
-    let patch_anchor: Option<String> = match &cli.patch {
-        Some(_) => Some(resolve_commit(
-            &repo,
-            cli.head.as_deref().unwrap_or("HEAD"),
-        )?),
+    // Resolve the --patch anchor *once*, here, as a full Rev, and thread it
+    // everywhere the run needs it (building the head, and the reproduction
+    // command) — resolving a mutable ref twice in one run risks it moving between
+    // lookups, so the head we review and the anchor we print could disagree. With
+    // an explicit `--head` the anchor is that commit; otherwise it is the default
+    // head — the working tree if dirty, else HEAD — so `--patch` composes with
+    // uncommitted work rather than silently dropping it (pass `--head HEAD` to
+    // review against the committed tree instead). A dirty-tree anchor is a
+    // synthetic, unpushable commit; the repro handles that by embedding.
+    let patch_anchor: Option<Rev> = match &cli.patch {
+        Some(_) => Some(match &cli.head {
+            Some(h) => commit_source(&repo, resolve_commit(&repo, h)?)?,
+            None => head_source(&repo)?,
+        }),
         None => None,
     };
 
@@ -782,9 +811,13 @@ fn run(cli: Cli) -> Result<()> {
         None => resolve_local(
             &repo,
             cli.base,
-            // For a --patch run the head arg *is* the anchor; pass the sha we
-            // already resolved so patch_source and the repro share one lookup.
-            patch_anchor.clone().or_else(|| cli.head.clone()),
+            // For a --patch run the head arg *is* the anchor commit we resolved
+            // above (a real sha, or the synthetic worktree commit); patch_source
+            // applies the diff onto it. Otherwise it's `--head` verbatim.
+            patch_anchor
+                .as_ref()
+                .map(|r| r.commit.clone())
+                .or_else(|| cli.head.clone()),
             cli.no_merge,
             patch_diff.as_deref(),
         )?,
@@ -942,38 +975,62 @@ fn run(cli: Cli) -> Result<()> {
     // would read as a plain review of it; a real commit (committed head, or a
     // PR's tip) is shown as-is.
     let (head_display, head_repro) = if cli.pr.is_some() {
-        // A PR: rebuild the head from GitHub's fork-point compare diff — durable
-        // past the force-pushes PRs rebase through. npd re-mints the merge from
-        // `--base merge^1` and the rebuilt head, so base drift is still shown.
+        // A PR: rebuild the head from its fork-point diff. npd re-mints the merge
+        // from `--base merge^1` and the rebuilt head, so base drift is still
+        // shown. The default is a sha-pinned GitHub compare (compact, durable past
+        // the force-pushes PRs rebase through). But GitHub's text `.diff` can't
+        // carry a binary blob, so a PR that touches binary files falls back to an
+        // embedded `git diff --binary` — npd has the PR head locally (`merge^2`),
+        // so it computes a binary-capable diff that reproduces offline.
         let fork = git_merge_base(&repo, &base.commit, &head.label)
             .context("computing the PR's fork point for the reproduction command")?;
-        (
-            head.label.clone(),
+        let repro = if diff_has_binary(&repo, &fork, &head.label)? {
+            let diff = git_diff_binary(&repo, &fork, &head.label)?;
+            HeadRepro::Embed { anchor: fork, diff }
+        } else {
             HeadRepro::Compare {
                 expr: format!("{fork}...{}", head.label),
                 anchor: fork,
-            },
-        )
-    } else if let Some(expr) = patch_compare {
-        // Reproducing a compare `--patch A...B`: re-emit the sha-pinned compare
-        // npd downloaded (`pin_compare` resolved both endpoints once, locally),
-        // applied onto the pre-resolved anchor. Both endpoints are immutable, so
-        // re-fetching it returns the identical diff — no re-resolution, and no
-        // embedded diff to bloat the report.
-        let anchor = patch_anchor.expect("a --patch run resolves its anchor above");
-        (format!("{anchor}\\*"), HeadRepro::Compare { anchor, expr })
-    } else if cli.patch.is_some() {
-        // Reproducing a file `--patch <path>`: the diff is a local file that
-        // won't exist elsewhere, so it rides along in the report, applied onto
-        // the pre-resolved anchor.
-        let anchor = patch_anchor.expect("a --patch run resolves its anchor above");
-        (
-            format!("{anchor}\\*"),
-            HeadRepro::Embed {
-                anchor,
-                diff: patch_diff.unwrap_or_default(),
-            },
-        )
+            }
+        };
+        (head.label.clone(), repro)
+    } else if let Some(anchor) = patch_anchor {
+        // Reproducing a --patch run. How depends on the anchor and the diff form:
+        if anchor.label == "worktree" {
+            // The anchor is the uncommitted working tree — a synthetic, unpushable
+            // commit we can't name with `--head`. Embed the whole diff from
+            // committed HEAD to the final head tree (worktree + patch), applied
+            // onto HEAD, exactly like a bare working-tree review. `patch_source`
+            // left `refs/npd/worktree` pointing at that final tree.
+            let hsha = resolve_commit(&repo, "HEAD")?;
+            let diff = git_diff_binary(&repo, &hsha, "refs/npd/worktree")?;
+            (
+                format!("{hsha}\\*"),
+                HeadRepro::Embed { anchor: hsha, diff },
+            )
+        } else if let Some(expr) = patch_compare {
+            // A compare `--patch A...B` onto a committed anchor: re-emit the
+            // sha-pinned compare npd downloaded (`pin_compare` resolved both
+            // endpoints once, locally). Immutable, so re-fetching returns the
+            // identical diff — no re-resolution, and no embed to bloat the report.
+            (
+                format!("{}\\*", anchor.commit),
+                HeadRepro::Compare {
+                    anchor: anchor.commit,
+                    expr,
+                },
+            )
+        } else {
+            // A file `--patch <path>` onto a committed anchor: the diff is a local
+            // file that won't exist elsewhere, so it rides along in the report.
+            (
+                format!("{}\\*", anchor.commit),
+                HeadRepro::Embed {
+                    anchor: anchor.commit,
+                    diff: patch_diff.unwrap_or_default(),
+                },
+            )
+        }
     } else if head.label == "worktree" {
         // A live uncommitted working tree: embed its captured diff, shown as
         // HEAD with the `\*` diff marker.
@@ -1468,5 +1525,36 @@ mod tests {
         // not a silently-mispinned compare.
         assert!(pin_compare(d, "only-one-side").is_err());
         assert!(pin_compare(d, &format!("{a}...no-such-ref")).is_err());
+    }
+
+    #[test]
+    fn diff_has_binary_flags_only_binary_changes() {
+        // A binary change (which GitHub's text `.diff` can't carry) must be
+        // detected so the PR repro embeds a `--binary` diff instead of a compare;
+        // a text-only change must not trip it.
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        g(d, &["-c", "init.defaultBranch=master", "init", "."]);
+        g(d, &["config", "user.email", "t@t"]);
+        g(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("f.txt"), "one\n").unwrap();
+        g(d, &["add", "."]);
+        g(d, &["commit", "-m", "base"]);
+        let base = resolve_commit(d, "HEAD").unwrap();
+
+        // A text-only change: not binary.
+        std::fs::write(d.join("f.txt"), "two\n").unwrap();
+        g(d, &["commit", "-am", "text"]);
+        let text = resolve_commit(d, "HEAD").unwrap();
+        assert!(!diff_has_binary(d, &base, &text).unwrap());
+
+        // Add a NUL-containing file: git treats it as binary.
+        std::fs::write(d.join("blob.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+        g(d, &["add", "blob.bin"]);
+        g(d, &["commit", "-m", "binary"]);
+        let bin = resolve_commit(d, "HEAD").unwrap();
+        assert!(diff_has_binary(d, &text, &bin).unwrap());
+        // The span still counts as binary when text changes are mixed in.
+        assert!(diff_has_binary(d, &base, &bin).unwrap());
     }
 }

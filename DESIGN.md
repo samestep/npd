@@ -478,7 +478,10 @@ The pair comes from one of three modes:
 - *Default* — no arguments: base-branch tip = `master`, head = `HEAD`. When the
   working tree has uncommitted edits to tracked files, `head` becomes the working
   tree itself (a synthetic tree-keyed revision, §6) so in-progress work is
-  reviewable. An explicit `--head` opts out.
+  reviewable. An explicit `--head` opts out. `--patch` (below) applies its diff
+  *on top of* this same default head — so with a dirty tree it stacks on the
+  working tree rather than silently dropping it; `--head HEAD` anchors it on the
+  committed tree instead.
 - *Explicit* — `--base <rev>` / `--head <rev>` override either end with any
   revision (ref, sha, tag, `HEAD~1`, …), resolved with `git rev-parse`.
 - *PR* — `npd --pr N` is shorthand for a `(base, head)` pair drawn from GitHub's
@@ -673,10 +676,16 @@ tree is recovered on another machine:
     why we don't try to recreate the exact commit from a `*.patch` (`git am`
     can't — a patch carries no committer identity/date or parent, so the sha
     differs anyway; the tree is what we need). One download covers a multi-commit
-    PR (a net diff, not per-commit patches). A fetch failure — an unreachable
-    sha, or a binary change GitHub's text `.diff` can't carry — is fatal, rather
-    than a silent mis-review. (npd re-mints the merge from `--base merge^1` and
-    the rebuilt head, so base drift is still reflected exactly as in the review.)
+    PR (a net diff, not per-commit patches). A fetch failure at reproduction —
+    an unreachable sha — is fatal, rather than a silent mis-review. (npd re-mints
+    the merge from `--base merge^1` and the rebuilt head, so base drift is still
+    reflected exactly as in the review.) **Exception — binary changes:** GitHub's
+    text `.diff` can't carry a binary blob, so a PR that touches binary files
+    would emit a repro that fails at `git apply`. npd detects this (`git diff
+    --numstat` shows `-\t-` for a binary file) and falls back to an embedded
+    `git diff --binary <fork> <head>` — it has the PR head locally (`merge^2`), so
+    it builds a binary-capable diff that reproduces offline (see the embed bullet).
+    The compare form is kept for the common text-only PR, where it stays compact.
   - **a compare `--patch A...B`** → `--head <sha> --patch <shaA>...<shaB>`, the
     same compare form, but with both endpoints resolved to shas *in the local
     clone* (`pin_compare`) before either the review's download or the repro is
