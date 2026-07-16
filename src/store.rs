@@ -1,14 +1,15 @@
-//! The SQLite fact store: the append-only observation log, in
-//! `~/.cache/nix-npd/npd.sqlite` (DESIGN.md §3–§4). Evals do *not* live here —
-//! they're standalone files (see `eval.rs`), so this DB stays tiny and holds
-//! only the small, index-worthy, append-only observation log.
+//! The SQLite fact store, in `~/.cache/nix-npd/npd.sqlite` (DESIGN.md §3–§4): the
+//! append-only observation log and the `--tests` eval cache. Full-set evals do
+//! *not* live here — they're standalone files (see `eval.rs`) — so what remains
+//! is only the small, index-worthy data an engine actually earns.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::evalfile::{restore_drv, strip_drv};
 use crate::model::{Observation, Outcome, Source, TestJob};
 
 // No migrations, ever (CLAUDE.md): change this schema freely and in place. The
@@ -34,29 +35,44 @@ CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 -- pure function of (tree, system, package-attr) — the source *tree*, not the
 -- commit (see `model::Rev`) — so we cache per package and reuse across reviews at
 -- a tree (a rebase/amend, or committing an as-is working tree, all hit).
+--
+-- The `(tree, system)` an eval belongs to is *interned* into `eval_key` and
+-- referenced by its small integer `id`, rather than repeated as a 40-char tree
+-- hash + system string on every row of both the table and its index. A handful
+-- of distinct keys back thousands of test rows, so this is ~25% off the whole
+-- `--tests` cache on real data (the biggest lever; DESIGN.md §4). It's also the
+-- eviction unit: dropping an eval file (`--clean`) purges its key here, cascading
+-- to the rows below.
+CREATE TABLE IF NOT EXISTS eval_key (
+    id     INTEGER PRIMARY KEY,
+    tree   TEXT NOT NULL,
+    system TEXT NOT NULL,
+    UNIQUE (tree, system)
+) STRICT;
+
 -- `test_pkg` marks a package fully evaluated (present even when it has zero
 -- tests, so a no-test package isn't re-evaluated every run); `test_drv` holds
 -- each resolved `<pkg>.tests.<name>` drv (a package may contribute zero rows).
--- Full drv paths, like `observation`. `skipped` is the test's own meta-blocked bit
--- (a test can be unsupported on this system even when its package builds — an
--- x86-only NixOS test on aarch64), so it's stored per test, not inferred from the
--- package.
+-- Drv paths are stored *stripped* of their constant `/nix/store/` prefix and
+-- `.drv` suffix, exactly like the eval files (`evalfile::strip_drv`) — restored
+-- on read.
+-- `skipped` is the test's own meta-blocked bit (a test can be unsupported on this
+-- system even when its package builds — an x86-only NixOS test on aarch64), so
+-- it's stored per test, not inferred from the package.
 CREATE TABLE IF NOT EXISTS test_pkg (
-    tree     TEXT NOT NULL,
-    system   TEXT NOT NULL,
+    key_id   INTEGER NOT NULL REFERENCES eval_key (id),
     pkg_attr TEXT NOT NULL,
-    PRIMARY KEY (tree, system, pkg_attr)
+    PRIMARY KEY (key_id, pkg_attr)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS test_drv (
-    tree      TEXT NOT NULL,
-    system    TEXT NOT NULL,
+    key_id    INTEGER NOT NULL REFERENCES eval_key (id),
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
     skipped   INTEGER NOT NULL,
-    PRIMARY KEY (tree, system, test_attr)
+    PRIMARY KEY (key_id, test_attr)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (tree, system, pkg_attr);
+CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (key_id, pkg_attr);
 ";
 
 fn source_str(s: Source) -> &'static str {
@@ -220,6 +236,37 @@ impl Store {
 
     // --- the `--tests` passthru.tests cache (DESIGN.md §4, §6) ---------------
 
+    /// The interned id for `(tree, system)`, or `None` if it has never been
+    /// recorded. One indexed point-lookup on the `eval_key` UNIQUE index; a
+    /// read-path miss lets the caller skip its query entirely (no rows exist).
+    fn key_id(&self, tree: &str, system: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM eval_key WHERE tree = ?1 AND system = ?2",
+                params![tree, system],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// [`Store::key_id`], creating the `(tree, system)` row if absent — the
+    /// write-path form, resolved once per `cache_test_eval` (not per row).
+    fn key_id_get_or_create(tx: &rusqlite::Transaction, tree: &str, system: &str) -> Result<i64> {
+        // `ON CONFLICT DO NOTHING` leaves `last_insert_rowid` unset on a hit, so
+        // always read the id back rather than trusting the insert.
+        tx.execute(
+            "INSERT INTO eval_key (tree, system) VALUES (?1, ?2) \
+             ON CONFLICT (tree, system) DO NOTHING",
+            params![tree, system],
+        )?;
+        Ok(tx.query_row(
+            "SELECT id FROM eval_key WHERE tree = ?1 AND system = ?2",
+            params![tree, system],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Which of `pkgs` have already had their tests evaluated at this key (so a
     /// run need only `eval_tests` the rest). Absence means "never evaluated",
     /// distinct from "evaluated, has no tests" (present here, no `test_drv` rows).
@@ -230,19 +277,20 @@ impl Store {
         pkgs: &[String],
     ) -> Result<std::collections::HashSet<String>> {
         let mut out = std::collections::HashSet::new();
+        let Some(key_id) = self.key_id(tree, system)? else {
+            return Ok(out); // key never recorded ⇒ nothing cached
+        };
         if pkgs.is_empty() {
             return Ok(out);
         }
         let placeholders = placeholders(pkgs.len());
         let sql = format!(
             "SELECT pkg_attr FROM test_pkg \
-             WHERE tree = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
+             WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [tree, system]
-                .into_iter()
-                .chain(pkgs.iter().map(String::as_str)),
+            std::iter::once(key_id.to_string()).chain(pkgs.iter().cloned()),
         );
         let rows = stmt.query_map(params, |r| r.get::<_, String>(0))?;
         for row in rows {
@@ -254,8 +302,9 @@ impl Store {
     /// Record a completed test eval of `pkgs` (the miss set) and its resulting
     /// `jobs`, in one transaction. Every package in `pkgs` gets a `test_pkg`
     /// marker (even those with no tests — so they're not re-evaluated); each job
-    /// with a drv gets a `test_drv` row. Idempotent (`INSERT OR REPLACE`), so a
-    /// re-run over the same key is harmless.
+    /// with a drv gets a `test_drv` row (its drv stored stripped — see
+    /// `evalfile::strip_drv`). Idempotent (`INSERT OR REPLACE`), so a re-run over
+    /// the same key is harmless.
     pub fn cache_test_eval(
         &mut self,
         tree: &str,
@@ -264,20 +313,20 @@ impl Store {
         jobs: &[TestJob],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let key_id = Self::key_id_get_or_create(&tx, tree, system)?;
         for pkg in pkgs {
             tx.execute(
-                "INSERT OR REPLACE INTO test_pkg (tree, system, pkg_attr) \
-                 VALUES (?1, ?2, ?3)",
-                params![tree, system, pkg],
+                "INSERT OR REPLACE INTO test_pkg (key_id, pkg_attr) VALUES (?1, ?2)",
+                params![key_id, pkg],
             )?;
         }
         for j in jobs {
             if let Some(drv) = &j.drv_path {
                 tx.execute(
                     "INSERT OR REPLACE INTO test_drv \
-                     (tree, system, pkg_attr, test_attr, drv_path, skipped) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![tree, system, j.pkg_attr, j.test_attr, drv, j.skipped],
+                     (key_id, pkg_attr, test_attr, drv_path, skipped) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key_id, j.pkg_attr, j.test_attr, strip_drv(drv), j.skipped],
                 )?;
             }
         }
@@ -286,8 +335,8 @@ impl Store {
     }
 
     /// All cached test drvs for `pkgs` at this key, as `test_attr → (drv_path,
-    /// skipped)` (only tests that resolved to a derivation). One query for the
-    /// whole set.
+    /// skipped)` (only tests that resolved to a derivation), with drv paths
+    /// restored to their full `/nix/store/…​.drv` form. One query for the whole set.
     pub fn tests_drvs_for(
         &self,
         tree: &str,
@@ -295,19 +344,20 @@ impl Store {
         pkgs: &[String],
     ) -> Result<std::collections::HashMap<String, (String, bool)>> {
         let mut out = std::collections::HashMap::new();
+        let Some(key_id) = self.key_id(tree, system)? else {
+            return Ok(out);
+        };
         if pkgs.is_empty() {
             return Ok(out);
         }
         let placeholders = placeholders(pkgs.len());
         let sql = format!(
             "SELECT test_attr, drv_path, skipped FROM test_drv \
-             WHERE tree = ?1 AND system = ?2 AND pkg_attr IN ({placeholders})",
+             WHERE key_id = ?1 AND pkg_attr IN ({placeholders})",
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params = rusqlite::params_from_iter(
-            [tree, system]
-                .into_iter()
-                .chain(pkgs.iter().map(String::as_str)),
+            std::iter::once(key_id.to_string()).chain(pkgs.iter().cloned()),
         );
         let rows = stmt.query_map(params, |r| {
             Ok((
@@ -317,10 +367,35 @@ impl Store {
             ))
         })?;
         for row in rows {
-            let (test_attr, drv_path, skipped) = row?;
-            out.insert(test_attr, (drv_path, skipped));
+            let (test_attr, stored, skipped) = row?;
+            let drv = restore_drv(Some(&stored)).expect("Some maps to Some");
+            out.insert(test_attr, (drv, skipped));
         }
         Ok(out)
+    }
+
+    /// Drop the `--tests` cache for one `(tree, system)` — its `eval_key` row and
+    /// the `test_pkg`/`test_drv` rows that reference it — when its eval file is
+    /// evicted (`--clean`, DESIGN.md §4). Returns the number of `test_drv` rows
+    /// removed (the bulk); a no-op if the key was never recorded. The caller
+    /// [`Store::vacuum`]s once after a batch of these to return the pages.
+    pub fn purge_tests(&mut self, tree: &str, system: &str) -> Result<usize> {
+        let Some(key_id) = self.key_id(tree, system)? else {
+            return Ok(0);
+        };
+        let tx = self.conn.transaction()?;
+        let drvs = tx.execute("DELETE FROM test_drv WHERE key_id = ?1", [key_id])?;
+        tx.execute("DELETE FROM test_pkg WHERE key_id = ?1", [key_id])?;
+        tx.execute("DELETE FROM eval_key WHERE id = ?1", [key_id])?;
+        tx.commit()?;
+        Ok(drvs)
+    }
+
+    /// Rebuild the database file to reclaim the pages freed by [`Store::purge_tests`]
+    /// (a `DELETE` only moves them to the freelist). Run once after an eviction batch.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM").context("vacuuming")?;
+        Ok(())
     }
 }
 
@@ -488,6 +563,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_tests_drops_one_key_only() {
+        let dir = std::env::temp_dir().join(format!("npd-purge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = Store::open(&dir.join("npd.sqlite")).unwrap();
+        let sys = "aarch64-linux";
+        let pkgs = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let job = |t: &str, drv: &str| TestJob {
+            pkg_attr: "hello".into(),
+            test_attr: t.into(),
+            drv_path: Some(drv.into()),
+            skipped: false,
+        };
+
+        // Two trees on the same system, each with one drv'd test.
+        s.cache_test_eval(
+            "treeA",
+            sys,
+            &pkgs(&["hello"]),
+            &[job("hello.tests.a", "/nix/store/a.drv")],
+        )
+        .unwrap();
+        s.cache_test_eval(
+            "treeB",
+            sys,
+            &pkgs(&["hello"]),
+            &[job("hello.tests.b", "/nix/store/b.drv")],
+        )
+        .unwrap();
+
+        // Evicting treeA removes exactly its rows (1 test_drv) and leaves treeB.
+        assert_eq!(s.purge_tests("treeA", sys).unwrap(), 1);
+        assert!(
+            s.tests_cached_pkgs("treeA", sys, &pkgs(&["hello"]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.tests_drvs_for("treeA", sys, &pkgs(&["hello"]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.tests_cached_pkgs("treeB", sys, &pkgs(&["hello"]))
+                .unwrap()
+                .contains("hello")
+        );
+        assert_eq!(
+            s.tests_drvs_for("treeB", sys, &pkgs(&["hello"]))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Purging an unknown key is a no-op, and VACUUM after a batch is fine.
+        assert_eq!(s.purge_tests("treeA", sys).unwrap(), 0);
+        s.vacuum().unwrap();
 
         let _ = fs::remove_dir_all(&dir);
     }

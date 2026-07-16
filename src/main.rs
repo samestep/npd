@@ -6,6 +6,7 @@
 
 mod build;
 mod cache;
+mod clean;
 mod eval;
 mod evalfile;
 mod live;
@@ -74,6 +75,17 @@ struct Cli {
     /// nixpkgs-review's "skipped").
     #[arg(long)]
     no_skip: bool,
+    /// Maintenance: evict cached eval files to bound the cache, then exit
+    /// without reviewing (DESIGN.md §4). Takes a size budget (`4GiB`, `500MB` —
+    /// keep the most-recently-used evals that fit, drop the least-recently-used
+    /// rest), a date (`2026-07-15`), or a duration (`2mo`, `1yr`, `30d` — drop
+    /// evals unused for longer). Each evicted eval also purges its `--tests` rows.
+    #[arg(
+        long,
+        value_name = "SIZE|DATE|DURATION",
+        conflicts_with_all = ["pr", "base", "head", "no_merge", "retry", "no_tests", "no_skip"]
+    )]
+    clean: Option<String>,
     /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
     /// cores and total RAM (see `eval::eval_slots`).
     #[command(flatten)]
@@ -650,6 +662,12 @@ fn repro_command(
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
+    // files and exit, reviewing nothing. It conflicts with every review knob.
+    if let Some(spec) = &cli.clean {
+        return clean::clean(&clean::CleanSpec::parse(spec)?);
+    }
+
     // Tests run by default; --no-tests opts out.
     let tests = !cli.no_tests;
     let no_skip = cli.no_skip;

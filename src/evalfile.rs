@@ -99,8 +99,9 @@ fn read_eval(path: &Path) -> Result<String> {
 /// The on-disk form of a drv path: strip the constant `/nix/store/` prefix and
 /// `.drv` suffix; [`restore_drv`] re-adds them. Every drv `nix-eval-jobs` emits
 /// has this exact shape (an errored attr carries no drv and is stored as an empty
-/// field, so this is only ever called on a real path).
-fn strip_drv(drv: &str) -> &str {
+/// field, so this is only ever called on a real path). Shared with the `--tests`
+/// SQLite cache (`store.rs`), which stores its drvs stripped for the same reason.
+pub(crate) fn strip_drv(drv: &str) -> &str {
     let stripped = drv
         .strip_prefix("/nix/store/")
         .and_then(|s| s.strip_suffix(".drv"));
@@ -112,8 +113,22 @@ fn strip_drv(drv: &str) -> &str {
 }
 
 /// Reconstruct a full drv path from its stored (stripped) form — see [`strip_drv`].
-fn restore_drv(field: Option<&str>) -> Option<String> {
+pub(crate) fn restore_drv(field: Option<&str>) -> Option<String> {
     field.map(|s| format!("/nix/store/{s}.drv"))
+}
+
+/// Mark an eval file as used *right now*, so LRU eviction (`--clean`,
+/// DESIGN.md §4) treats a cache *hit* as recent. Reading a file doesn't touch
+/// its mtime, so a base eval reused across dozens of reviews would otherwise
+/// look as old as its first write and be evicted before a one-off; stamping it
+/// on every review that consults it makes mtime a true last-*used* time. A
+/// freshly written eval is already current, so this is only for the hits.
+/// Best-effort: a failure to re-stamp only risks the file looking staler than
+/// it is (evicted a little early, then re-derived), never a correctness bug.
+pub fn touch_eval(path: &Path) {
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// One parsed eval row, borrowing from its line: attr, stored-form drv, and the
@@ -426,6 +441,29 @@ pub fn changed_tests(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touch_eval_advances_mtime() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("npd-touch-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("e.tsv.zst");
+        fs::write(&path, b"contents").unwrap();
+        // Backdate the file, then touch it: mtime must move forward and the
+        // contents must survive (a write-open must not truncate).
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        touch_eval(&path);
+        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(after > old, "touch_eval should advance the mtime");
+        assert_eq!(fs::read(&path).unwrap(), b"contents");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn drv_paths_round_trip_stripped() {

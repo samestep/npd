@@ -123,9 +123,16 @@ eval, so a file beats SQLite on every axis that matters here:
   thread (~12 ms, never materializing a whole file) rather than ~114k
   primary-key point-lookups (~94 ms). The cross-cutting SQL queries that would
   have justified a table never materialised (we only ever diff);
-- **evictable** — when the cache grows too big, delete whole eval files for old
-  commits; no `VACUUM` of a monolith. (The "millions of tiny files" failure mode
-  is about a file *per attr*; one file per *eval* is ~two files per review.)
+- **evictable** — `npd --clean <SIZE|DATE|DURATION>` (`src/clean.rs`) deletes
+  whole eval files least-recently-used-first until the corpus fits a byte budget
+  (`4GiB`), or drops everything older than a date (`2026-07-15`) or unused for a
+  duration (`2mo`); no `VACUUM` of a monolith. "Least-recently-*used*" is the
+  file's mtime, which a cache **hit** re-stamps (`evalfile::touch_eval`, called
+  from `eval::eval_pairs`) — a read alone wouldn't, so a shared base eval reused
+  across many reviews would otherwise look as old as its first write. Evicting an
+  eval also purges that `(tree, system)`'s `--tests` rows (below), keyed on the
+  same tree, so the two stay in lockstep. (The "millions of tiny files" failure
+  mode is about a file *per attr*; one file per *eval* is ~two files per review.)
 
 Writes are atomic — a uniquely-named temp file in the same directory (rename is
 only atomic within one filesystem), then `rename` into place — so a crash can't
@@ -134,21 +141,33 @@ the same eval can't collide.
 
 **Observations → SQLite** (`npd.sqlite`), where the append-only log actually
 wants an engine: indexed lookup by `drvpath`, transactional appends, no torn
-writes. It stays tiny (KBs) — this is what SQLite is *for* here. Build logs are
-stored nowhere: Nix keeps them under `/nix/var/log/nix/drvs` (`nix log <drv>`,
-success or failure).
+writes. The log itself stays tiny (KBs — a few hundred rows); the database
+file's bulk is the `--tests` cache below, which scales with the number of
+distinct trees reviewed (like the eval files, but ~two orders of magnitude
+smaller per review). Build logs are stored nowhere: Nix keeps them under
+`/nix/var/log/nix/drvs` (`nix log <drv>`, success or failure).
 
 **The `--tests` cache → SQLite too** (`test_pkg` / `test_drv` tables, §6). Same
 reasoning inverted from evals: it's a *keyed, incremental, partial* fact (look up
 a package, append new ones), not a bulk write-once map to diff — so it wants the
-engine, not a file. It's small (a handful of short strings per changed package;
-KBs–single-digit MB per commit, dwarfed by the eval files) and evictable by
-commit, and full drv paths are stored as-is like the observation log.
+engine, not a file. Two space measures keep it lean, since it dominates the
+database file: the `(tree, system)` a row belongs to is **interned** into an
+`eval_key` table and referenced by a small integer id rather than repeated as a
+40-char tree hash on every row of both the table and its index (the bulk of the
+win — a handful of keys back thousands of rows); and drv paths are stored
+**stripped** of their constant `/nix/store/…​.drv` affixes, exactly like the eval
+files (`evalfile::strip_drv`), restored on read. Every query is already scoped to
+one constant `(tree, system)`, so interning adds no per-row join — just one
+indexed point-lookup per operation to resolve the id. It's evictable by
+`(tree, system)` in lockstep with the eval files (`Store::purge_tests`, driven by
+`--clean`), then `VACUUM`ed to return the pages. Only the observation log keeps
+full drv paths (it's tiny, and its `blocker` column stores output paths, not
+drv paths, so stripping wouldn't be uniform there).
 
 ```
 ~/.cache/nix-npd/
-  npd.sqlite                    # observation log + --tests cache (tiny)
-  <sys>/<tree>.tsv.zst          # attr→drv maps (zstd), one file per eval
+  npd.sqlite                    # observation log (tiny) + --tests cache (the bulk)
+  <sys>/<tree>.tsv.zst          # attr→drv maps (zstd), one file per eval — evicted by --clean
 ```
 
 `nix-eval-jobs` stderr (a full Nix traceback per errored attr — megabytes over a

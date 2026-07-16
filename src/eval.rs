@@ -988,7 +988,13 @@ pub fn eval_pairs(repo: &Path, pairs: &[(Rev, String)], opts: EvalOpts) -> Resul
     // concurrently — harmless (the write is atomic) but 2× the work.
     let mut seen = std::collections::HashSet::new();
     for (i, (rev, system)) in pairs.iter().enumerate() {
-        if !eval_path(&rev.tree, system)?.exists() && seen.insert((&rev.tree, system)) {
+        let path = eval_path(&rev.tree, system)?;
+        if path.exists() {
+            // A cache hit: mark the file used now so LRU eviction (`--clean`,
+            // DESIGN.md §4) keeps a frequently-reused eval (e.g. a shared base)
+            // warm rather than judging it by its first-write time.
+            crate::evalfile::touch_eval(&path);
+        } else if seen.insert((&rev.tree, system)) {
             todo.push(i);
         }
     }
