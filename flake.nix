@@ -115,6 +115,7 @@
             nix
             nix-eval-jobs
             pkgs.nix-output-monitor
+            pkgs.markdown-toc
             pkgs.sqlite # for poking at the store during development
           ];
         };

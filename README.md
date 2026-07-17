@@ -53,3 +53,51 @@ That command may not give you the same result if you run it yourself, but `npd`'
 > - `coqPackages.odd-order`
 > - `coqPackages.validsdp`
 > </details>
+
+---
+
+<!-- toc -->
+
+- [Values](#values)
+- [Installation](#installation)
+  - [Temporary](#temporary)
+- [Usage](#usage)
+- [Acknowledgments](#acknowledgments)
+
+<!-- tocstop -->
+
+## Values
+
+`npd` strives to be
+
+- **causal.** Derivations are built both on both sides of the change, so the report makes it clear which failures are regressions and which were preexisting.
+
+- **cached.** It takes a nontrivial amount of time to run Nix evaluations and failing builds, so the tool caches these; re-runs should always take less than one second.
+
+- **efficient.** Caching is not an excuse to be slow the first time, so on a cold run, the tool automatically chooses a point along the Pareto frontier to parallelize proportionally to how much RAM is available.
+
+- **reproducible.** Often a change may be on a branch that gets force-pushed later, or there may be uncommitted local changes, so the report always includes a command to reproduce the exact same Git tree on both sides.
+
+- **friendly.** Users running the tool in a rich terminal should get nice colors and live progress indicators, and users running it over a pipe should get lean but informative progress lines.
+
+## Installation
+
+### Temporary
+
+This repository provides a [Nix flake](https://wiki.nixos.org/wiki/Flakes), so if you have flakes enabled, the quickest way to use it is via the [`nix shell`](https://nix.dev/manual/nix/2.34/command-ref/new-cli/nix3-env-shell.html) command:
+
+```sh
+nix shell github:samestep/npd
+```
+
+This starts a shell within your shell which has `npd` available on the `PATH`.
+
+## Usage
+
+```sh
+npd --help
+```
+
+## Acknowledgments
+
+This project owes its existence to its primary inspiration, Jörg Thalheim's [nixpkgs-review](https://github.com/Mic92/nixpkgs-review), which serves a similar purpose but makes different design tradeoffs.
