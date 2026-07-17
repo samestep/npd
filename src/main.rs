@@ -16,9 +16,11 @@ mod report;
 mod store;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::process::Command as Proc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -784,6 +786,107 @@ fn repro_command(
 /// folded in. Threaded from [`run_phases`] into the build and the report.
 type PerSystemChanged = Vec<(String, Vec<evalfile::ChangedAttr>)>;
 
+/// The not-skipped changed-package names for the `--tests` eval, per side. A
+/// package skipped on a side (meta-blocked) contributes no tests there — building
+/// a test drv builds the package — unless `--no-skip`. Sorted + deduped.
+fn changed_names(changed: &[evalfile::ChangedAttr], no_skip: bool) -> (Vec<String>, Vec<String>) {
+    let names_on = |not_skipped: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
+        let mut v: Vec<String> = changed
+            .iter()
+            .filter(|c| no_skip || not_skipped(c))
+            .map(|c| c.attr.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    (names_on(|c| !c.base_skipped), names_on(|c| !c.head_skipped))
+}
+
+/// Per-system state accumulated as each platform's eval lands (DESIGN §9). Its
+/// `Store` lives here rather than being shared by `&` because `rusqlite`'s
+/// connection is `!Sync` and this is touched from eval worker threads (behind the
+/// mutex in [`run_phases`]).
+struct TestsAccum {
+    store: store::Store,
+    /// Systems whose eval is complete and diff computed (processed once).
+    processed: HashSet<String>,
+    /// Each system's changed set (pre-`--tests`), assembled in system order later.
+    changed: HashMap<String, Vec<evalfile::ChangedAttr>>,
+    /// The `tests` phase node, created lazily on the first system with misses.
+    tests_phase: Option<Arc<live::Node>>,
+    /// The test-listing work + its pre-created (blue) leaves, parallel — executed
+    /// grouped after all eval.
+    requests: Vec<(Rev, String, Vec<String>)>,
+    nodes: Vec<Arc<live::Node>>,
+    /// First error from a worker-thread callback, re-raised after eval.
+    fatal: Option<anyhow::Error>,
+}
+
+/// Reveal a ready system's `tests` leaves (blue) in the tree, in fixed system
+/// order, and record its test-listing work for the later grouped execution. A
+/// side with no cache misses (or none once the package is skipped) contributes
+/// nothing; a system with no misses at all never appears.
+#[allow(clippy::too_many_arguments)]
+fn reveal_system_tests(
+    acc: &mut TestsAccum,
+    tree: &live::Tree,
+    systems: &[String],
+    base: &Rev,
+    head: &Rev,
+    no_skip: bool,
+    sys: &str,
+    changed: &[evalfile::ChangedAttr],
+) -> Result<()> {
+    let (base_names, head_names) = changed_names(changed, no_skip);
+    let sys_index = systems.iter().position(|s| s == sys).unwrap() as i64;
+
+    // Sides with cache misses, deduped by tree (a shared base/head tree is one
+    // eval key, hence one leaf) — mirroring the old global (tree, system) dedup.
+    let mut pending: Vec<(Rev, Vec<String>)> = Vec::new();
+    let mut seen_trees = HashSet::new();
+    for (rev, names) in [(base, &base_names), (head, &head_names)] {
+        if !seen_trees.insert(rev.tree.clone()) {
+            continue;
+        }
+        let cached = acc.store.tests_cached_pkgs(&rev.tree, sys, names)?;
+        let misses: Vec<String> = names
+            .iter()
+            .filter(|p| !cached.contains(*p))
+            .cloned()
+            .collect();
+        if !misses.is_empty() {
+            pending.push((rev.clone(), misses));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    // Lazily create the `tests` phase node — a plain push lands it after the
+    // `evaluate` subtree (instantiate/probe don't exist yet).
+    let phase = acc
+        .tests_phase
+        .get_or_insert_with(|| tree.node("tests", 0))
+        .clone();
+
+    // Build this system's subtree (system spine for multi, then its miss leaves)
+    // and splice it into fixed system order.
+    let depth = if tree.multi() { 2 } else { 1 };
+    let mut subtree: Vec<Arc<live::Node>> = Vec::new();
+    if tree.multi() {
+        subtree.push(tree.detached_node(sys.to_string(), 1, sys_index));
+    }
+    for (rev, misses) in pending {
+        let node = tree.detached_counter(rev.display.clone(), depth, -1, sys_index);
+        subtree.push(node.clone());
+        acc.requests.push((rev, sys.to_string(), misses));
+        acc.nodes.push(node);
+    }
+    tree.insert_sorted(&phase, subtree);
+    Ok(())
+}
+
 /// The pre-build phases — everything that runs behind the one live progress tree
 /// (DESIGN §6, §9): evaluate both sides, diff to the changed set, expand
 /// `--tests`, instantiate the `.drv`s the build will touch, and probe the cache.
@@ -802,78 +905,85 @@ fn run_phases(
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
 ) -> Result<(PerSystemChanged, Vec<build::Target>)> {
-    eval::eval_two(repo, base, head, systems, opts, tree, handle)?;
+    // Per-system state, accumulated as each platform's eval lands so its `tests`
+    // appear (blue) the moment its diff is computable — while other platforms are
+    // still evaluating — in fixed system order (DESIGN §9). The test-listing
+    // itself still runs grouped, after all eval; only the appearance is early.
+    let accum = Mutex::new(TestsAccum {
+        store: store::Store::open(&paths::db_path()?)?,
+        processed: HashSet::new(),
+        changed: HashMap::new(),
+        tests_phase: None,
+        requests: Vec::new(),
+        nodes: Vec::new(),
+        fatal: None,
+    });
+    // Process a system once BOTH its eval files exist (cached up front, or cold
+    // once evaluated): compute its diff, and — with `--tests` — reveal its test
+    // leaves. Called per eval completion (worker threads), for cached systems once
+    // the eval nodes exist (main thread, from `eval_pairs`), and a final sweep
+    // (main thread). Idempotent via `processed`; the coarse mutex serializes the
+    // brief work (a ~12 ms diff, a quick SQLite read, a tree splice), and
+    // `rusqlite` being `!Sync` is why the `Store` lives inside it, not shared by `&`.
+    let process = |sys: &str| {
+        let mut acc = accum.lock().unwrap();
+        if acc.fatal.is_some() || acc.processed.contains(sys) {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            if !evalfile::eval_path(&base.tree, sys)?.exists()
+                || !evalfile::eval_path(&head.tree, sys)?.exists()
+            {
+                return Ok(()); // not both sides yet
+            }
+            acc.processed.insert(sys.to_string());
+            let changed = evalfile::changed_set(&base.tree, &head.tree, sys)?;
+            if tests {
+                reveal_system_tests(&mut acc, tree, systems, base, head, no_skip, sys, &changed)?;
+            }
+            acc.changed.insert(sys.to_string(), changed);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            acc.fatal = Some(e);
+        }
+    };
 
-    // The changed set per system — each attr's drv + meta-blocked bit per side —
-    // from a linear merge of the two sorted eval files. Computed once, reused
-    // for build+render.
-    let mut per_system_changed: Vec<(String, Vec<evalfile::ChangedAttr>)> = Vec::new();
+    // Cold systems fire `process` as their eval lands; systems already cached
+    // when eval starts fire once `eval_two` has created the eval nodes (so `tests`
+    // still sorts below `evaluate`). The sweep then catches the fully-cached run,
+    // where `eval_two` creates no nodes and fires nothing at all.
+    eval::eval_two(repo, base, head, systems, opts, tree, handle, &process)?;
     for sys in systems {
-        let changed = evalfile::changed_set(&base.tree, &head.tree, sys)?;
-        per_system_changed.push((sys.clone(), changed));
+        process(sys);
     }
 
-    // --tests: expand each system's changed set with the changed packages'
-    // `passthru.tests`. We resolve the tests on *both* sides (through the
-    // per-package SQLite cache) and keep a test as a changed attr only when its
-    // drv actually differs base→head — exactly `changed_set`'s own semantics, so
-    // the test rows classify (regression / fixed / new / …) like every other
-    // attr. A side where the package is skipped contributes no tests (a test drv
-    // depends on the package, so building it would build the skipped package)
-    // unless --no-skip.
+    // Assemble the diffs in system order; surface any callback error.
+    let mut acc = accum.lock().unwrap();
+    if let Some(e) = acc.fatal.take() {
+        return Err(e);
+    }
+    let mut per_system_changed: PerSystemChanged = systems
+        .iter()
+        .map(|s| (s.clone(), acc.changed.remove(s).unwrap_or_default()))
+        .collect();
+    let requests = std::mem::take(&mut acc.requests);
+    let nodes = std::mem::take(&mut acc.nodes);
+    drop(acc);
+
+    // --tests: run the already-revealed test-listing leaves as one grouped
+    // scheduler pass, cache the results, then fold each system's test rows into
+    // its changed set — classified (regression / fixed / new / …) like any attr.
     if tests {
-        let mut store = store::Store::open(&paths::db_path()?)?;
-        // The not-skipped changed-package names per system, on each side.
-        let per_sys: Vec<(Vec<String>, Vec<String>)> = per_system_changed
-            .iter()
-            .map(|(_, changed)| {
-                let names_on = |not_skipped: fn(&evalfile::ChangedAttr) -> bool| -> Vec<String> {
-                    let mut v: Vec<String> = changed
-                        .iter()
-                        .filter(|c| no_skip || not_skipped(c))
-                        .map(|c| c.attr.clone())
-                        .collect();
-                    v.sort();
-                    v.dedup();
-                    v
-                };
-                (names_on(|c| !c.base_skipped), names_on(|c| !c.head_skipped))
-            })
-            .collect();
-
-        // Gather the cache misses across every (tree, system, side) and
-        // evaluate them all through one scheduler, so `--tests` schedules and
-        // displays as a unit like the full eval. Deduped by (tree, system).
-        let mut requests: Vec<(Rev, String, Vec<String>)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for ((sys, _), (base_names, head_names)) in per_system_changed.iter().zip(&per_sys) {
-            for (rev, names) in [(base, base_names), (head, head_names)] {
-                if !seen.insert((rev.tree.clone(), sys.clone())) {
-                    continue;
-                }
-                let cached = store.tests_cached_pkgs(&rev.tree, sys, names)?;
-                let misses: Vec<String> = names
-                    .iter()
-                    .filter(|p| !cached.contains(*p))
-                    .cloned()
-                    .collect();
-                if !misses.is_empty() {
-                    requests.push((rev.clone(), sys.clone(), misses));
-                }
-            }
-        }
-        let jobs_per = eval::eval_tests_many(repo, &requests, tree, handle)?;
+        let jobs_per = eval::eval_tests(repo, &requests, nodes, handle)?;
+        let mut acc = accum.lock().unwrap();
         for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
-            store.cache_test_eval(&rev.tree, sys, misses, jobs)?;
+            acc.store.cache_test_eval(&rev.tree, sys, misses, jobs)?;
         }
-
-        // The per-package cache is now populated; build each system's test-row
-        // diff, classified like every other attr.
-        for ((sys, changed), (base_names, head_names)) in
-            per_system_changed.iter_mut().zip(&per_sys)
-        {
-            let bmap = store.tests_drvs_for(&base.tree, sys, base_names)?;
-            let hmap = store.tests_drvs_for(&head.tree, sys, head_names)?;
+        for (sys, changed) in per_system_changed.iter_mut() {
+            let (base_names, head_names) = changed_names(changed, no_skip);
+            let bmap = acc.store.tests_drvs_for(&base.tree, sys, &base_names)?;
+            let hmap = acc.store.tests_drvs_for(&head.tree, sys, &head_names)?;
             changed.extend(evalfile::changed_tests(&bmap, &hmap));
         }
     }

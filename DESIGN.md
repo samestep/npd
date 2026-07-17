@@ -789,6 +789,22 @@ shared persistent progress tree (`live::Tree`, driven through `live::with_live`)
 that every phase feeds nodes into — is already done (§6); the executor is the part
 deferred until the cold-run wall-time justifies it.
 
+One **display** slice of the pipeline is implemented ahead of the executor: the
+`tests` phase's nodes appear per system *as each system's eval lands*, not after
+a whole-set barrier. The instant a system has both its base and head eval files
+(cached up front, or cold once evaluated), `run_phases` computes that system's
+diff and — while the other systems are still evaluating — reveals its `tests`
+leaves as blue/waiting nodes, spliced into the tree in fixed system order (a
+later-ready system that sorts earlier is inserted *above* an already-present one,
+via `live::Tree::insert_sorted`; a system with no test-misses never appears). The
+signal is a per-`(commit, system)` callback (`eval_two`'s `on_eval_done`) fired as
+each eval file is written, plus an up-front firing for systems already cached;
+the work runs off a coarse mutex on the eval worker threads (its `Store` lives
+inside because `rusqlite` is `!Sync`). Crucially this is *display only* — the
+test-listing jobs themselves still run as **one grouped scheduler pass after all
+eval finishes** (`eval::eval_tests` over the pre-created leaves), so nothing is
+co-scheduled with eval; only the tree's appearance is early.
+
 **Resolved gotcha (root-caused) — `nix-eval-jobs` restarted its worker after
 every job on macOS.** The ~100× darwin slowdown (measured ~1.5 attrs/s on an
 `aarch64-darwin` VM vs ~155 attrs/s on `aarch64-linux`, same hardware) was a

@@ -267,6 +267,11 @@ pub struct Node {
     depth: usize,
     counter: bool,
     percent: bool,
+    /// Orders this node among its phase's children for [`Tree::insert_sorted`]
+    /// (the system index, so a `tests` subtree slots into fixed system order even
+    /// when it becomes ready out of order). Ignored by nodes that are only ever
+    /// pushed in creation order.
+    sort_key: i64,
     state: AtomicU8,
     /// Items/drvs streamed so far — the middle plain count.
     count: AtomicI64,
@@ -282,12 +287,20 @@ pub struct Node {
 }
 
 impl Node {
-    fn new(label: String, depth: usize, counter: bool, percent: bool, total: i64) -> Self {
+    fn new(
+        label: String,
+        depth: usize,
+        counter: bool,
+        percent: bool,
+        total: i64,
+        sort_key: i64,
+    ) -> Self {
         Self {
             label,
             depth,
             counter,
             percent,
+            sort_key,
             state: AtomicU8::new(WAIT),
             count: AtomicI64::new(0),
             total: AtomicI64::new(total),
@@ -402,14 +415,14 @@ impl Tree {
 
     /// Append a count-less node (a phase, a system, a network ref, `enumerate`).
     pub fn node(&self, label: impl Into<String>, depth: usize) -> Arc<Node> {
-        let n = Arc::new(Node::new(label.into(), depth, false, false, -1));
+        let n = Arc::new(Node::new(label.into(), depth, false, false, -1, 0));
         self.nodes.lock().unwrap().push(n.clone());
         n
     }
 
     /// Append a counting leaf; `total` is `-1` when the denominator is unknown.
     pub fn counter(&self, label: impl Into<String>, depth: usize, total: i64) -> Arc<Node> {
-        let n = Arc::new(Node::new(label.into(), depth, true, false, total));
+        let n = Arc::new(Node::new(label.into(), depth, true, false, total, 0));
         self.nodes.lock().unwrap().push(n.clone());
         n
     }
@@ -417,9 +430,64 @@ impl Tree {
     /// Append a leaf that shows a dim `NN%` shard-progress readout — for a phase
     /// whose true item total is unknowable ahead of time (`evaluate`).
     pub fn percent(&self, label: impl Into<String>, depth: usize) -> Arc<Node> {
-        let n = Arc::new(Node::new(label.into(), depth, true, true, 0));
+        let n = Arc::new(Node::new(label.into(), depth, true, true, 0, 0));
         self.nodes.lock().unwrap().push(n.clone());
         n
+    }
+
+    /// Build a count-less node WITHOUT appending it — a subtree spine (a `tests`
+    /// system level) to hand to [`insert_sorted`]. `sort_key` orders it among a
+    /// phase's children.
+    pub fn detached_node(
+        &self,
+        label: impl Into<String>,
+        depth: usize,
+        sort_key: i64,
+    ) -> Arc<Node> {
+        Arc::new(Node::new(label.into(), depth, false, false, -1, sort_key))
+    }
+
+    /// Build a counting leaf WITHOUT appending it (for [`insert_sorted`]).
+    pub fn detached_counter(
+        &self,
+        label: impl Into<String>,
+        depth: usize,
+        total: i64,
+        sort_key: i64,
+    ) -> Arc<Node> {
+        Arc::new(Node::new(label.into(), depth, true, false, total, sort_key))
+    }
+
+    /// Splice a subtree in among `phase`'s children, keeping them ordered by
+    /// `sort_key` — so a subtree that becomes ready out of order (a platform whose
+    /// eval finished late but sorts early) still lands at its fixed position. The
+    /// subtree is a contiguous block (its root, then deeper descendants); its
+    /// root's `sort_key` decides placement. Inserted before the first existing
+    /// child with a larger `sort_key`, else after `phase`'s last descendant.
+    pub fn insert_sorted(&self, phase: &Arc<Node>, subtree: Vec<Arc<Node>>) {
+        let Some(root) = subtree.first() else { return };
+        let key = root.sort_key;
+        let pd = phase.depth;
+        let mut nodes = self.nodes.lock().unwrap();
+        let p = nodes
+            .iter()
+            .position(|n| Arc::ptr_eq(n, phase))
+            .expect("phase node must already be in the tree");
+        // Walk `phase`'s descendants; note the first direct child (depth pd+1)
+        // whose key exceeds ours. `i` ends at the first node past phase's subtree.
+        let mut i = p + 1;
+        let mut at = None;
+        while i < nodes.len() && nodes[i].depth > pd {
+            if nodes[i].depth == pd + 1 && nodes[i].sort_key > key {
+                at = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let at = at.unwrap_or(i);
+        for (k, n) in subtree.into_iter().enumerate() {
+            nodes.insert(at + k, n);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -752,6 +820,30 @@ mod tests {
                 "\x1b[34m  HEAD\x1b[0m       0".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn insert_sorted_keeps_phase_children_in_key_order() {
+        // `tests` systems appear as each becomes ready, but a later-ready system
+        // that sorts earlier splices ABOVE an already-present one — the section
+        // stays in fixed system order regardless of completion order.
+        let tree = Tree::new(0, true);
+        let phase = tree.node("tests", 0);
+        for (label, key) in [("sysB", 1), ("sysA", 0), ("sysC", 2)] {
+            let sys = tree.detached_node(label, 1, key);
+            let leaf = tree.detached_counter("HEAD", 2, -1, key);
+            tree.insert_sorted(&phase, vec![sys, leaf]);
+        }
+        let lines = node_lines(&tree);
+        // tests + three (system, leaf) pairs, all present.
+        assert_eq!(lines.len(), 7);
+        let out = lines.join("\n");
+        let (a, b, c) = (
+            out.find("sysA").unwrap(),
+            out.find("sysB").unwrap(),
+            out.find("sysC").unwrap(),
+        );
+        assert!(a < b && b < c, "must render in sort-key order: {out:?}");
     }
 
     #[test]

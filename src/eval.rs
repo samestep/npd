@@ -352,16 +352,17 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 }
 
 /// Evaluate the `passthru.tests` of several `(commit, system, packages)`
-/// requests **together**, through one shard scheduler — so `--tests` schedules
-/// and displays them as a unit (all lines up front, one shared queue, cross-eval
-/// load balancing) like the full eval, rather than one request at a time.
+/// requests **together**, through one shard scheduler — one shared queue,
+/// cross-eval load balancing — after all eval finishes. `nodes` are the `tests`
+/// leaves the caller already created per-system as each platform's eval landed
+/// (parallel to `requests`; DESIGN §9), which this drives to running/done.
 /// Returns the resolved [`TestJob`]s per request, parallel to `requests` (one
 /// `<pkg>.tests.<name>` per job). Callers pass only the packages not already
 /// cached (see `main`); an empty/all-empty `requests` does no work.
-pub fn eval_tests_many(
+pub fn eval_tests(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
-    tree: &live::Tree,
+    nodes: Vec<Arc<live::Node>>,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<TestJob>>> {
     if requests.is_empty() {
@@ -375,11 +376,9 @@ pub fn eval_tests_many(
     let total: usize = requests.iter().map(|(_, _, p)| p.len()).sum();
     let shard_size = total.div_ceil(slots * 2).max(1);
 
-    let groups: Vec<(String, String)> = requests
-        .iter()
-        .map(|(rev, sys, _)| (sys.clone(), rev.display.clone()))
-        .collect();
-    let nodes = add_phase(tree, "tests", &groups, Leaf::Count);
+    // The `tests` leaves were created per-system as each platform's eval landed
+    // (DESIGN §9), so `nodes` is parallel to `requests`; execution is still one
+    // grouped scheduler run, after all eval.
     let labels: Vec<String> = requests
         .iter()
         .map(|(rev, system, _)| format!("tests {} ({system})", rev.display))
@@ -975,8 +974,15 @@ pub fn eval_pairs(
     opts: EvalOpts,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
+    // Called with a `system` the moment one of its eval files lands, so the
+    // caller can compute that system's diff and show its `tests` early (DESIGN §9).
+    on_eval_done: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     let mut todo: Vec<usize> = Vec::new();
+    // Systems with a cache hit this run — signalled to `on_eval_done` once the
+    // eval nodes exist (below), so their `tests` can appear early while the cold
+    // systems evaluate, yet still sort under `evaluate` (DESIGN §9).
+    let mut cached: Vec<&str> = Vec::new();
     // Dedupe on the eval key `(tree, system)`: `npd X X`, repeated --system, or
     // two revisions sharing a tree would otherwise run the same eval twice
     // concurrently — harmless (the write is atomic) but 2× the work.
@@ -988,11 +994,14 @@ pub fn eval_pairs(
             // DESIGN.md §4) keeps a frequently-reused eval (e.g. a shared base)
             // warm rather than judging it by its first-write time.
             crate::evalfile::touch_eval(&path);
+            cached.push(system);
         } else if seen.insert((&rev.tree, system)) {
             todo.push(i);
         }
     }
     if todo.is_empty() {
+        // Nothing to evaluate — the caller sweeps the (fully-cached) systems
+        // itself; we've created no nodes and fire nothing.
         return Ok(());
     }
 
@@ -1020,6 +1029,14 @@ pub fn eval_pairs(
     // (blue) under the same commit displays while `enumerate` runs (DESIGN §6).
     let enum_nodes = add_phase(tree, "enumerate", &groups, Leaf::None);
     let eval_nodes = add_phase(tree, "evaluate", &groups, Leaf::Percent);
+
+    // Now that the eval nodes exist, signal systems already cached this run so
+    // their `tests` appear immediately (a side whose other side is still cold is
+    // a no-op until that lands — the caller re-checks both files). A cold group
+    // signals when it completes (below).
+    for system in cached {
+        on_eval_done(system);
+    }
 
     // Phase 1: enumerate each pair's top-level attr names — the space phase 2
     // shards. This runs through the *same scheduler*, one shard per pair (the
@@ -1088,10 +1105,14 @@ pub fn eval_pairs(
                 || on_item(1),
             )
         },
-        // Assemble the eval into its one cached file, keyed on the tree.
+        // Assemble the eval into its one cached file, keyed on the tree, then
+        // signal that this `(tree, system)` is now available — the last side of a
+        // system to land lets the caller diff it and reveal its `tests` (§9).
         |gi, rows| {
             let (rev, system) = meta[gi];
-            write_eval(&eval_path(&rev.tree, system)?, &rows)
+            write_eval(&eval_path(&rev.tree, system)?, &rows)?;
+            on_eval_done(system);
+            Ok(())
         },
     )
 }
@@ -1099,6 +1120,7 @@ pub fn eval_pairs(
 /// Ensure both revisions are evaluated across all systems (they run
 /// concurrently). Deduped by their eval key `(tree, system)` in [`eval_pairs`],
 /// so a `base`/`head` that share a tree pay for one eval, not two.
+#[allow(clippy::too_many_arguments)]
 pub fn eval_two(
     repo: &Path,
     base: &Rev,
@@ -1107,6 +1129,7 @@ pub fn eval_two(
     opts: EvalOpts,
     tree: &live::Tree,
     handle: live::LiveHandle<'_>,
+    on_eval_done: &(dyn Fn(&str) + Sync),
 ) -> Result<()> {
     // System-major, base-then-head — the order the tree displays them (grouped
     // by system, base above head), so the shard scheduler works through them in
@@ -1116,7 +1139,7 @@ pub fn eval_two(
         pairs.push((base.clone(), s.clone()));
         pairs.push((head.clone(), s.clone()));
     }
-    eval_pairs(repo, &pairs, opts, tree, handle)
+    eval_pairs(repo, &pairs, opts, tree, handle, on_eval_done)
 }
 
 #[cfg(test)]
