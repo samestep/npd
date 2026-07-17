@@ -2,7 +2,7 @@
 
 For example, `npd --pr 542936`:
 
-> ## [`npd`](.) report: [`dce745c`](https://github.com/NixOS/nixpkgs/commit/dce745ce155ce35a8121ee7280e7ae53559cead3) → [`5f96e8f`](https://github.com/NixOS/nixpkgs/commit/5f96e8fa57f8703504fe54b642bfcb4264aa9d4d)
+> ## [`npd`](/) report: [`dce745c`](https://github.com/NixOS/nixpkgs/commit/dce745ce155ce35a8121ee7280e7ae53559cead3) → [`5f96e8f`](https://github.com/NixOS/nixpkgs/commit/5f96e8fa57f8703504fe54b642bfcb4264aa9d4d)
 >
 > ```sh
 > npd --base dce745ce155ce35a8121ee7280e7ae53559cead3 --head 840dbf16cf78ddd86383d55a3beefa44df86cfd9 --patch 840dbf16cf78ddd86383d55a3beefa44df86cfd9...5f96e8fa57f8703504fe54b642bfcb4264aa9d4d -s x86_64-linux
