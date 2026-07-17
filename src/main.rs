@@ -105,6 +105,9 @@ struct Cli {
         conflicts_with_all = ["pr", "base", "head", "patch", "no_merge", "retry", "no_tests", "no_skip"]
     )]
     clean: Option<String>,
+    /// Skip `--clean`'s confirmation prompt and delete immediately (for scripts).
+    #[arg(short = 'y', long, requires = "clean")]
+    yes: bool,
     /// Eval-scheduler knobs; each unset flag is auto-sized from the machine's
     /// cores and total RAM (see `eval::eval_slots`).
     #[command(flatten)]
@@ -1033,7 +1036,7 @@ fn run(cli: Cli) -> Result<()> {
     // `--clean` is a standalone maintenance action (DESIGN.md §4): evict eval
     // files and exit, reviewing nothing. It conflicts with every review knob.
     if let Some(spec) = &cli.clean {
-        return clean::clean(&clean::CleanSpec::parse(spec)?);
+        return clean::clean(&clean::CleanSpec::parse(spec)?, cli.yes);
     }
 
     // Tests run by default; --no-tests opts out.

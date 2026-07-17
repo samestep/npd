@@ -137,7 +137,10 @@ eval, so a file beats SQLite on every axis that matters here:
 - **evictable** — `npd --clean <SIZE|DATE|DURATION>` (`src/clean.rs`) deletes
   whole eval files least-recently-used-first until the corpus fits a byte budget
   (`4GiB`), or drops everything older than a date (`2026-07-15`) or unused for a
-  duration (`2mo`); no `VACUUM` of a monolith. "Least-recently-*used*" is the
+  duration (`2mo`); no `VACUUM` of a monolith. It's a destructive maintenance
+  action, so it first prints exactly what it would remove and waits for a `y`
+  on stdin, deleting nothing without it (`-y` skips the prompt for scripts; a
+  closed stdin reads as *no*). "Least-recently-*used*" is the
   file's mtime, which a cache **hit** re-stamps (`evalfile::touch_eval`, called
   from `eval::eval_pairs`) — a read alone wouldn't, so a shared base eval reused
   across many reviews would otherwise look as old as its first write. Evicting an

@@ -221,9 +221,11 @@ fn gather(root: &std::path::Path) -> Result<Vec<Eval>> {
 }
 
 /// Evict eval files per `spec`, purge each evicted `(tree, system)`'s `--tests`
-/// rows, and vacuum the DB once. Prints a one-line summary. This is the whole
-/// `--clean` action — it reviews nothing.
-pub fn clean(spec: &CleanSpec) -> Result<()> {
+/// rows, and vacuum the DB once. This is the whole `--clean` action — it reviews
+/// nothing. It first prints exactly what it *would* remove and asks for
+/// confirmation on stdin, deleting only on a yes (`assume_yes` — the `-y` flag —
+/// skips the prompt, for scripts). Nothing is touched until confirmed.
+pub fn clean(spec: &CleanSpec, assume_yes: bool) -> Result<()> {
     let root = cache_root()?;
     let files = gather(&root)?;
     let total: u64 = files.iter().map(|f| f.size).sum();
@@ -238,25 +240,98 @@ pub fn clean(spec: &CleanSpec) -> Result<()> {
         return Ok(());
     }
 
+    // Show what would be removed, oldest-used first (the order eviction favours).
+    let freed: u64 = victims.iter().map(|&i| files[i].size).sum();
+    let mut shown = victims.clone();
+    shown.sort_by_key(|&i| files[i].mtime);
+    println!(
+        "Would evict {} of {} eval file(s), freeing {} ({} would remain). \
+         Each also drops that eval's --tests cache rows:",
+        victims.len(),
+        files.len(),
+        human_bytes(freed),
+        human_bytes(total - freed),
+    );
+    for &i in &shown {
+        let f = &files[i];
+        println!(
+            "  {}/{}  {:>9}  last used {}",
+            f.system,
+            short_tree(&f.tree),
+            human_bytes(f.size),
+            fmt_date(f.mtime),
+        );
+    }
+
+    if !assume_yes && !confirm("Delete these? [y/N] ")? {
+        println!("Aborted; nothing deleted.");
+        return Ok(());
+    }
+
     let mut store = Store::open(&db_path()?)?;
-    let mut freed = 0u64;
     let mut rows = 0usize;
     for &i in &victims {
         let f = &files[i];
         fs::remove_file(&f.path).with_context(|| format!("removing {}", f.path.display()))?;
-        freed += f.size;
         rows += store.purge_tests(&f.tree, &f.system)?;
     }
     store.vacuum()?;
 
     println!(
-        "evicted {} eval file(s) ({} freed, {} test row(s) purged); {} of eval cache remains",
+        "Evicted {} eval file(s) ({} freed, {} test row(s) purged); {} of eval cache remains.",
         victims.len(),
         human_bytes(freed),
         rows,
         human_bytes(total - freed),
     );
     Ok(())
+}
+
+/// Prompt on stderr and read a yes/no answer from stdin; `true` only on an
+/// explicit yes. A closed stdin (EOF, e.g. `--clean` in a pipe with no input)
+/// reads as *no* — the safe default for a destructive action.
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::Write;
+    // Prompt on stderr so a redirected stdout keeps only the machine-ish summary.
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        eprintln!(); // move past the prompt line on EOF
+        return Ok(false);
+    }
+    Ok(is_yes(&line))
+}
+
+/// Whether a prompt answer means yes (`y`/`yes`, case- and space-insensitive).
+fn is_yes(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The first 12 hex chars of a tree hash — enough to recognise, short enough to list.
+fn short_tree(tree: &str) -> &str {
+    &tree[..tree.len().min(12)]
+}
+
+/// Format a Unix time (seconds) as a UTC `YYYY-MM-DD` date, for the preview list.
+fn fmt_date(secs: u64) -> String {
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Inverse of [`days_from_civil`] (Howard Hinnant's `civil_from_days`): days
+/// since 1970-01-01 back to `(year, month, day)`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
 }
 
 /// A byte count in binary units, e.g. `3.4 GiB` (exact `B` under 1 KiB).
@@ -378,5 +453,35 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn confirmation_needs_an_explicit_yes() {
+        for ok in ["y", "Y", "yes", "YES", " yes \n", "y\n"] {
+            assert!(is_yes(ok), "{ok:?} should confirm");
+        }
+        for no in ["", "\n", "n", "no", "nope", "yep", "sure", "1"] {
+            assert!(!is_yes(no), "{no:?} should NOT confirm");
+        }
+    }
+
+    #[test]
+    fn date_formatting_round_trips_the_cutoff_parser() {
+        // fmt_date is the inverse of parse_date's civil arithmetic.
+        assert_eq!(fmt_date(0), "1970-01-01");
+        assert_eq!(fmt_date(20649 * 86_400), "2026-07-15");
+        // Round-trip a spread of dates through days_from_civil -> civil_from_days.
+        for &(y, m, d) in &[(1970, 1, 1), (2000, 2, 29), (2026, 7, 17), (2038, 12, 31)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+    }
+
+    #[test]
+    fn short_tree_is_a_prefix() {
+        assert_eq!(
+            short_tree("6ad2cd58bc5c3fe03106020942764b763300789b"),
+            "6ad2cd58bc5c"
+        );
+        assert_eq!(short_tree("abc"), "abc"); // shorter than 12 is fine
     }
 }
