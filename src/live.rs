@@ -38,8 +38,6 @@ use std::time::{Duration, Instant};
 
 use console::{Term, style, truncate_str};
 
-use crate::model::Rev;
-
 /// Braille spinner frames (indicatif's default set).
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -210,13 +208,18 @@ pub fn with_live<R>(
 pub fn human_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    // `h`/`m`/`s` fields, dropping empty leading ones: `0s`, `51s`, `1m29s`,
+    // `1h00m00s`. Lower fields are zero-padded once a higher one is present so
+    // they don't jump width. The widest form is `9h59m59s` (8 chars, up to ~10h);
+    // right-pad the rest so the text after the clock doesn't shift as it grows.
     let clock = if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
     } else {
-        format!("{m}:{s:02}")
+        format!("{s}s")
     };
-    // The widest common form is `h:mm:ss` (7 chars, up to ~10h); pad the rest.
-    format!("{clock:>7}")
+    format!("{clock:>8}")
 }
 
 // --- the progress tree (DESIGN §6, §9) ---------------------------------------
@@ -488,13 +491,7 @@ fn state_color(state: u8) -> &'static str {
 /// systems, the two `display`s at their nesting depth, and any PR refs or
 /// `--patch` compare expr. Passed to [`Tree::new`] so the columns never shift as
 /// phases appear (all these labels are known at resolution).
-pub fn plan_label_width(
-    systems: &[String],
-    base: &Rev,
-    head: &Rev,
-    pr: Option<u64>,
-    compare: Option<&str>,
-) -> usize {
+pub fn plan_label_width(systems: &[String], pr: Option<u64>, compare: Option<&str>) -> usize {
     let ind = INDENT.len();
     let mut w = [
         "fetch",
@@ -509,10 +506,10 @@ pub fn plan_label_width(
     .map(|p| p.len())
     .max()
     .unwrap();
-    let cdepth = if systems.len() > 1 { 2 } else { 1 };
-    for d in [&base.display, &head.display] {
-        w = w.max(ind * cdepth + d.chars().count());
-    }
+    // The base/head `display`s are absorbed dynamically: a phase adds all its
+    // commit nodes atomically (as WAIT) before any of them shows a number, so the
+    // column already clears them by the first frame with a count — nothing shifts,
+    // and they need not be known here (they aren't until resolution finishes).
     if systems.len() > 1 {
         for s in systems {
             w = w.max(ind + s.chars().count());
@@ -520,7 +517,6 @@ pub fn plan_label_width(
     }
     if let Some(n) = pr {
         w = w.max(ind + format!("refs/pull/{n}/merge").len());
-        w = w.max(ind + format!("refs/pull/{n}/head").len());
     }
     if let Some(c) = compare {
         w = w.max(ind + c.chars().count());
@@ -533,7 +529,7 @@ pub fn plan_label_width(
 /// spacing does the separating, the rule just marks it. Dimmed only on a
 /// terminal, so a redirected stderr gets plain hyphens.
 pub fn separator() {
-    let rule = "-".repeat(48);
+    let rule = "---";
     eprintln!();
     if Term::stderr().is_term() {
         eprintln!("{DIM}{rule}{RESET}");
@@ -549,26 +545,17 @@ mod tests {
 
     #[test]
     fn elapsed_is_a_fixed_width_clock() {
-        // A plain m:ss clock, gaining an h: field past an hour, right-padded to a
-        // constant width so the text after the timer doesn't shift as it grows.
-        assert_eq!(human_elapsed(Duration::from_secs(0)), "   0:00");
-        assert_eq!(human_elapsed(Duration::from_secs(51)), "   0:51");
-        assert_eq!(human_elapsed(Duration::from_secs(89)), "   1:29");
-        assert_eq!(human_elapsed(Duration::from_secs(90)), "   1:30");
-        assert_eq!(human_elapsed(Duration::from_secs(3600)), "1:00:00");
-        assert_eq!(human_elapsed(Duration::from_secs(5400)), "1:30:00");
-        // Every rendering up to ~10h is the same width.
+        // h/m/s fields dropping empty leading ones, starting at `0s`, right-padded
+        // to a constant width so the text after the timer doesn't shift as it grows.
+        assert_eq!(human_elapsed(Duration::from_secs(0)), "      0s");
+        assert_eq!(human_elapsed(Duration::from_secs(51)), "     51s");
+        assert_eq!(human_elapsed(Duration::from_secs(89)), "   1m29s");
+        assert_eq!(human_elapsed(Duration::from_secs(90)), "   1m30s");
+        assert_eq!(human_elapsed(Duration::from_secs(3600)), "1h00m00s");
+        assert_eq!(human_elapsed(Duration::from_secs(5400)), "1h30m00s");
+        // Every rendering up to ~10h is the same width; `9h59m59s` is the widest.
         for s in [0, 51, 599, 3600, 35999] {
-            assert_eq!(human_elapsed(Duration::from_secs(s)).len(), 7);
-        }
-    }
-
-    fn rev(display: &str) -> Rev {
-        Rev {
-            tree: "t".into(),
-            commit: "c".into(),
-            label: "l".into(),
-            display: display.into(),
+            assert_eq!(human_elapsed(Duration::from_secs(s)).len(), 8);
         }
     }
 
@@ -647,26 +634,16 @@ mod tests {
 
     #[test]
     fn plan_width_clears_every_label() {
-        let (b, h) = (rev("master"), rev("HEAD"));
         // Single system: the longest phase name (`instantiate`, 11) is the floor.
-        assert_eq!(
-            plan_label_width(&["aarch64-linux".into()], &b, &h, None, None),
-            11
-        );
+        assert_eq!(plan_label_width(&["aarch64-linux".into()], None, None), 11);
         // Multi-system: a system name at depth 1 is widest (2 + 13).
         assert_eq!(
-            plan_label_width(
-                &["aarch64-linux".into(), "x86_64-linux".into()],
-                &b,
-                &h,
-                None,
-                None
-            ),
+            plan_label_width(&["aarch64-linux".into(), "x86_64-linux".into()], None, None),
             15
         );
         // A PR fetch ref at depth 1 (2 + 19) beats them all.
         assert_eq!(
-            plan_label_width(&["aarch64-linux".into()], &b, &h, Some(431), None),
+            plan_label_width(&["aarch64-linux".into()], Some(431), None),
             21
         );
     }

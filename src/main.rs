@@ -936,112 +936,131 @@ fn run(cli: Cli) -> Result<()> {
     let opts = cli.eval;
     let repo = resolve_repo(cli.path)?;
 
-    // --patch: obtain the diff up front — a local file, or a GitHub compare
-    // download (`A...B`) — so `resolve_local` can build the synthetic head and
-    // the reproduction command can re-emit it. Disambiguated as Nix path syntax:
-    // a `/` means a path, otherwise a compare expression.
-    //
-    // For a compare, `pin_compare` resolves *both* endpoints in the local clone
-    // to shas *once*, and that immutable `<shaA>...<shaB>` drives both this
-    // download and the reproduction command. A raw `A...B` echoed into the repro
-    // would re-resolve against GitHub's *current* tips on reproduction, so a
-    // moved branch could hand back a different diff — a different tree, reviewed
-    // silently at exit zero. `patch_compare` is the pinned expression (compare
-    // form only); the repro echoes it rather than re-deriving it.
-    let mut patch_compare: Option<String> = None;
-    let patch_diff: Option<String> = match &cli.patch {
-        None => None,
-        Some(value) if value.contains('/') => {
-            // A relative diff path resolves against the `-C` directory, like
-            // git's own `-C` (which npd's flag mirrors) — not npd's process cwd.
-            // A default run (no `-C`) has `repo` == cwd, so this is a no-op there.
-            let p = std::path::Path::new(value);
-            let p = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                repo.join(p)
-            };
-            Some(
-                std::fs::read_to_string(&p)
-                    .with_context(|| format!("reading the --patch file {}", p.display()))?,
-            )
-        }
-        Some(value) if value.contains("...") => {
-            let expr = pin_compare(&repo, value)?;
-            let diff = fetch_compare_diff(&expr)?;
-            patch_compare = Some(expr);
-            Some(diff)
-        }
-        Some(value) => bail!(
-            "--patch must be a path (containing a `/`, e.g. `./x.diff`) or a \
-             compare expression `A...B`; got {value:?}"
-        ),
-    };
-
-    // Resolve the --patch anchor *once*, here, as a full Rev, and thread it
-    // everywhere the run needs it (building the head, and the reproduction
-    // command) — resolving a mutable ref twice in one run risks it moving between
-    // lookups, so the head we review and the anchor we print could disagree. With
-    // an explicit `--head` the anchor is that commit; otherwise it is the default
-    // head — the working tree if dirty, else HEAD — so `--patch` composes with
-    // uncommitted work rather than silently dropping it (pass `--head HEAD` to
-    // review against the committed tree instead). A dirty-tree anchor is a
-    // synthetic, unpushable commit; the repro handles that by embedding.
-    let patch_anchor: Option<Rev> = match &cli.patch {
-        Some(_) => Some(match &cli.head {
-            Some(h) => commit_source(&repo, resolve_commit(&repo, h)?, h.clone())?,
-            None => head_source(&repo)?,
-        }),
-        None => None,
-    };
-
-    let (base, head) = match cli.pr {
-        Some(pr) => resolve_pr(&repo, UPSTREAM, pr, cli.no_merge)?,
-        None => resolve_local(
-            &repo,
-            cli.base,
-            // For a --patch run the head arg *is* the anchor commit we resolved
-            // above (a real sha, or the synthetic worktree commit); patch_source
-            // applies the diff onto it. Otherwise it's `--head` verbatim.
-            patch_anchor
-                .as_ref()
-                .map(|r| r.commit.clone())
-                .or_else(|| cli.head.clone()),
-            // …and its live-tree name is the anchor's `display` (the ref the user
-            // typed, since the arg above is the resolved anchor sha).
-            patch_anchor.as_ref().map(|r| r.display.clone()),
-            cli.no_merge,
-            patch_diff.as_deref(),
-        )?,
-    };
     let systems = resolve_systems(cli.system);
 
-    // The one persistent progress tree, spanning eval → probe (the build itself
-    // is nom's display). Its number columns start after the widest label the run
-    // can produce — all known now, so nothing shifts as phases appear (DESIGN §6).
+    // The one persistent progress tree, spanning resolution → probe (the build
+    // itself is nom's display). Created BEFORE any network so its clock — and any
+    // `fetch`/`download` node — animate live from the first frame: the network can
+    // be arbitrarily slow, which is the whole reason to display it. Its number
+    // columns start past the widest label the run can produce (DESIGN §6); the
+    // base/head `display`s aren't known until resolution finishes, but each phase
+    // adds its commit nodes atomically before any shows a count, so the column
+    // still never shifts.
+    let compare_literal = cli.patch.as_deref().filter(|v| v.contains("..."));
     let tree = live::Tree::new(
-        live::plan_label_width(&systems, &base, &head, cli.pr, patch_compare.as_deref()),
+        live::plan_label_width(&systems, cli.pr, compare_literal),
         systems.len() > 1,
     );
-    // Network work already happened during resolution; record it as done nodes so
-    // the tree documents every network touch (DESIGN §6–§7).
-    if let Some(pr) = cli.pr {
-        let fetch = tree.node("fetch", 0);
-        fetch.set_done();
-        tree.node(format!("refs/pull/{pr}/merge"), 1).set_done();
-    } else if let Some(expr) = &patch_compare {
-        tree.node("download", 0).set_done();
-        tree.node(expr.clone(), 1).set_done();
-    }
 
-    let (per_system_changed, targets) = live::with_live(
-        |tick| tree.render(tick),
-        |handle| {
-            run_phases(
-                &repo, &base, &head, &systems, opts, policy, tests, no_skip, &tree, handle,
-            )
-        },
-    )?;
+    // Resolution and every pre-build phase run inside one `with_live`, so the tree
+    // is up for the whole slow stretch (the PR / `--patch` fetch included). The
+    // closure yields the resolved pair plus the `--patch` bits the reproduction
+    // command needs downstream.
+    let (base, head, patch_anchor, patch_compare, patch_diff, per_system_changed, targets) =
+        live::with_live(
+            |tick| tree.render(tick),
+            |handle| {
+                // --patch: obtain the diff — a local file, or a GitHub compare
+                // download (`A...B`). `pin_compare` resolves both endpoints to
+                // shas *once* (locally), and that immutable `<shaA>...<shaB>` drives
+                // both the download and the reproduction command, so a moved branch
+                // can't hand back a different diff on reproduction. The download is
+                // a live network node.
+                let mut patch_compare: Option<String> = None;
+                let patch_diff: Option<String> =
+                    match &cli.patch {
+                        None => None,
+                        Some(value) if value.contains('/') => {
+                            // A relative diff path resolves against the `-C` directory
+                            // (like git's `-C`), not npd's cwd; a default run's `repo`
+                            // is cwd. A local file, so no network node.
+                            let p = std::path::Path::new(value);
+                            let p = if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                repo.join(p)
+                            };
+                            Some(std::fs::read_to_string(&p).with_context(|| {
+                                format!("reading the --patch file {}", p.display())
+                            })?)
+                        }
+                        Some(value) if value.contains("...") => {
+                            let expr = pin_compare(&repo, value)?;
+                            // A live network node, labeled with the literal expression
+                            // the user typed — not the sha-pinned form npd fetches.
+                            let dl = tree.node("download", 0);
+                            let child = tree.node(value.clone(), 1);
+                            dl.set_running();
+                            child.set_running();
+                            let diff = fetch_compare_diff(&expr)?;
+                            child.set_done();
+                            dl.set_done();
+                            patch_compare = Some(expr);
+                            Some(diff)
+                        }
+                        Some(value) => bail!(
+                            "--patch must be a path (containing a `/`, e.g. `./x.diff`) or a \
+                         compare expression `A...B`; got {value:?}"
+                        ),
+                    };
+
+                // Resolve the --patch anchor *once* (a mutable ref read twice could
+                // move between lookups): an explicit `--head`, else the default head
+                // (the working tree if dirty, else HEAD), so `--patch` composes with
+                // uncommitted work. A dirty-tree anchor is a synthetic commit the
+                // repro embeds.
+                let patch_anchor: Option<Rev> = match &cli.patch {
+                    Some(_) => Some(match &cli.head {
+                        Some(h) => commit_source(&repo, resolve_commit(&repo, h)?, h.clone())?,
+                        None => head_source(&repo)?,
+                    }),
+                    None => None,
+                };
+
+                let (base, head) = match cli.pr {
+                    Some(pr) => {
+                        // The PR ref fetch is a network node — a moving pointer npd
+                        // re-fetches every run (DESIGN §6).
+                        let f = tree.node("fetch", 0);
+                        let m = tree.node(format!("refs/pull/{pr}/merge"), 1);
+                        f.set_running();
+                        m.set_running();
+                        let pair = resolve_pr(&repo, UPSTREAM, pr, cli.no_merge);
+                        m.set_done();
+                        f.set_done();
+                        pair?
+                    }
+                    None => resolve_local(
+                        &repo,
+                        cli.base,
+                        // For a --patch run the head arg *is* the resolved anchor
+                        // commit (patch_source applies the diff onto it); otherwise
+                        // it's `--head` verbatim.
+                        patch_anchor
+                            .as_ref()
+                            .map(|r| r.commit.clone())
+                            .or_else(|| cli.head.clone()),
+                        // …its live-tree name is the anchor's `display` (the typed ref).
+                        patch_anchor.as_ref().map(|r| r.display.clone()),
+                        cli.no_merge,
+                        patch_diff.as_deref(),
+                    )?,
+                };
+
+                let (per_system_changed, targets) = run_phases(
+                    &repo, &base, &head, &systems, opts, policy, tests, no_skip, &tree, handle,
+                )?;
+                Ok((
+                    base,
+                    head,
+                    patch_anchor,
+                    patch_compare,
+                    patch_diff,
+                    per_system_changed,
+                    targets,
+                ))
+            },
+        )?;
     // Freeze the tree as scrollback, then the consistent separator before what
     // follows (nom's build, or the report).
     if !tree.is_empty() {

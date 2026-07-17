@@ -1041,9 +1041,11 @@ pub fn eval_pairs(
         items,
         opts.shard_size.unwrap_or(NAMES_PER_SHARD),
         slots,
-        // One streamed job per enumerated name, so the enumerated count is the
-        // total the count climbs toward.
-        true,
+        // No denominator: `nix-eval-jobs` descends into `recurseForDerivations`
+        // sets (haskellPackages, the python sets, …), so it streams far more drvs
+        // than there are enumerated top-level names — the enumerated count is not
+        // a valid total. Like `enumerate`, show a bare climbing count.
+        false,
         handle,
         // Evaluate one shard by streaming its own one-worker `nix-eval-jobs`.
         |gi, label, names, on_item| {
