@@ -273,8 +273,11 @@ pub struct Node {
     /// Item total for the ` / total` column, or `-1` when unknown / not a total
     /// node. (A `percent` node leaves this `-1`; its `%` comes from the shards.)
     total: AtomicI64,
-    /// Shards done / total, for a `percent` node's `NN%` readout.
+    /// Shards done / currently-running / total, for a `percent` node's `NN%`
+    /// readout. Counting a running shard as half-done makes the percentage climb
+    /// smoothly rather than only stepping when a whole shard lands.
     shards_done: AtomicI64,
+    shards_running: AtomicI64,
     shards_total: AtomicI64,
 }
 
@@ -289,6 +292,7 @@ impl Node {
             count: AtomicI64::new(0),
             total: AtomicI64::new(total),
             shards_done: AtomicI64::new(0),
+            shards_running: AtomicI64::new(0),
             shards_total: AtomicI64::new(0),
         }
     }
@@ -322,8 +326,24 @@ impl Node {
         }
     }
 
-    /// A shard of this group finished (`done` of `total`). Feeds a `percent`
-    /// node's rightmost `NN%` column; every other kind ignores it.
+    /// A shard of this group started running (feeds a `percent` node's `NN%`,
+    /// which counts a running shard as half-done for a smoother climb).
+    pub fn shard_started(&self) {
+        if self.percent {
+            self.shards_running.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A shard stopped running (completed or aborted) — the mate to
+    /// [`shard_started`], so the running count reflects only in-flight shards.
+    pub fn shard_finished(&self) {
+        if self.percent {
+            self.shards_running.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A shard of this group *completed* (`done` of `total`). Feeds a `percent`
+    /// node's `NN%` column; every other kind ignores it.
     pub fn shard_progress(&self, done: usize, total: usize) {
         if self.percent {
             self.shards_total.store(total as i64, Ordering::Relaxed);
@@ -426,6 +446,7 @@ impl Tree {
                 total: n.total.load(Ordering::Relaxed),
                 percent: n.percent,
                 sdone: n.shards_done.load(Ordering::Relaxed),
+                srunning: n.shards_running.load(Ordering::Relaxed),
                 stotal: n.shards_total.load(Ordering::Relaxed),
             })
             .collect();
@@ -440,8 +461,9 @@ impl Tree {
 
         let mut out = Vec::with_capacity(snap.len() + 1);
         for (i, r) in snap.iter().enumerate() {
-            let (depth, label, counter, count, total, percent, sdone, stotal) = (
-                r.depth, r.label, r.counter, r.count, r.total, r.percent, r.sdone, r.stotal,
+            let (depth, label, counter, count, total, percent, sdone, srunning, stotal) = (
+                r.depth, r.label, r.counter, r.count, r.total, r.percent, r.sdone, r.srunning,
+                r.stotal,
             );
             let col = state_color(eff[i]);
             let indent = INDENT.repeat(depth);
@@ -460,14 +482,15 @@ impl Tree {
             let left = format!("{indent}{label}");
             let pad = " ".repeat(left_w.saturating_sub(left.chars().count()));
             let count_s = format!("{count:>NUM_W$}");
-            // The rightmost column is a live progress hint, so it shows while
-            // waiting and running and collapses once done: a `percent` node's dim
-            // `NN%` (right-aligned in the number column, `%`, no slash), else a dim
-            // ` / total` when the item total is known.
-            let right = if eff[i] == DONE {
-                String::new()
-            } else if percent {
-                let pct = (sdone * 100 / stotal.max(1)).clamp(0, 100);
+            // The rightmost column stays for the node's whole life (waiting →
+            // running → done, never dropped): a `percent` node's dim `NN%` (right-
+            // aligned in the number column, `%`, no slash), else a dim ` / total`
+            // when the item total is known. A running shard counts as half-done —
+            // the mean of finished and finished+running shards — so the percentage
+            // climbs smoothly instead of only stepping when a whole shard lands.
+            let right = if percent {
+                let denom = (2 * stotal).max(1);
+                let pct = ((2 * sdone + srunning) * 100 / denom).clamp(0, 100);
                 let p = format!("{pct:>NUM_W$}");
                 if color {
                     format!("{DIM}   {p}%{RESET}")
@@ -514,6 +537,7 @@ struct Row<'a> {
     total: i64,
     percent: bool,
     sdone: i64,
+    srunning: i64,
     stotal: i64,
 }
 
@@ -669,25 +693,34 @@ mod tests {
     }
 
     #[test]
-    fn percent_node_shows_count_plus_dim_pct_while_running() {
-        // evaluate: a plain drv count in the middle column, PLUS a dim shard `NN%`
-        // right-aligned in the rightmost column, while running.
+    fn percent_node_smooths_and_keeps_pct_when_done() {
+        // evaluate: a plain drv count (middle) PLUS a dim shard `NN%` (right). A
+        // running shard counts as half-done — mean(finished, finished+running) —
+        // so 3 done + 2 running of 10 reads (3 + 5) / 2 = 4 → 40%.
         let tree = Tree::new(0, false);
         tree.node("evaluate", 0);
         let head = tree.percent("HEAD", 1);
         head.set_running();
         head.add_count(142001);
-        head.shard_progress(3, 8); // 37%
+        head.shard_progress(3, 10);
+        head.shard_started();
+        head.shard_started();
         assert_eq!(
             node_lines(&tree),
             vec![
                 "\x1b[33mevaluate\x1b[0m".to_string(),
-                "\x1b[33m  HEAD  \x1b[0m  142001\x1b[90m       37%\x1b[0m".to_string(),
+                "\x1b[33m  HEAD  \x1b[0m  142001\x1b[90m       40%\x1b[0m".to_string(),
             ]
         );
-        // Once done, the middle count stays (pinned) and the percent column drops.
+        // Done keeps the percent (now 100%) beside the pinned count — not dropped.
+        head.shard_finished();
+        head.shard_finished();
+        head.shard_progress(10, 10);
         head.group_done(226117);
-        assert_eq!(node_lines(&tree)[1], "\x1b[32m  HEAD  \x1b[0m  226117");
+        assert_eq!(
+            node_lines(&tree)[1],
+            "\x1b[32m  HEAD  \x1b[0m  226117\x1b[90m      100%\x1b[0m"
+        );
     }
 
     #[test]

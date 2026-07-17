@@ -766,7 +766,6 @@ struct ShardGroup<T> {
     items: Vec<String>,
     shards_total: usize,
     shards_done: AtomicUsize,
-    shards_running: AtomicUsize,
     rows: Mutex<Vec<T>>,
 }
 
@@ -819,7 +818,6 @@ fn run_shards<T: Send>(
                 shards_total: items.len().div_ceil(shard_size),
                 items,
                 shards_done: AtomicUsize::new(0),
-                shards_running: AtomicUsize::new(0),
                 rows: Mutex::new(Vec::new()),
             }
         })
@@ -897,7 +895,7 @@ fn run_shards<T: Send>(
                     let slice = &g.items[shard.items.clone()];
 
                     g.node.set_running();
-                    g.shards_running.fetch_add(1, Ordering::Relaxed);
+                    g.node.shard_started();
                     let outcome = (|| -> Result<()> {
                         let on_item = |n: usize| g.node.stream(n as i64);
                         let rows = eval_shard(shard.group, &labels[shard.group], slice, &on_item)?;
@@ -916,7 +914,7 @@ fn run_shards<T: Send>(
                         }
                         Ok(())
                     })();
-                    g.shards_running.fetch_sub(1, Ordering::Relaxed);
+                    g.node.shard_finished();
 
                     match outcome {
                         Ok(()) => {
