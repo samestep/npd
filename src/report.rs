@@ -36,6 +36,16 @@ pub enum State {
 }
 
 impl State {
+    /// Every state, in enum-declaration order — used to render the symbol legend.
+    const ALL: [State; 6] = [
+        State::Built,
+        State::Failed,
+        State::Blocked,
+        State::Skipped,
+        State::Absent,
+        State::Unknown,
+    ];
+
     fn glyph(self) -> &'static str {
         match self {
             State::Built => "✅",
@@ -44,6 +54,18 @@ impl State {
             State::Skipped => "⏩",
             State::Absent => "➖",
             State::Unknown => "❔",
+        }
+    }
+
+    /// Legend gloss for this state's glyph (see [`render`]'s symbol legend).
+    fn label(self) -> &'static str {
+        match self {
+            State::Built => "successfully built",
+            State::Failed => "failed to build",
+            State::Blocked => "dependency failed to build",
+            State::Skipped => "didn't try to build",
+            State::Absent => "doesn't exist",
+            State::Unknown => "couldn't try to build",
         }
     }
 
@@ -119,90 +141,6 @@ fn priority(base: State, head: State) -> (u8, i32, i32) {
     (0, head.goodness() - base.goodness(), head.goodness())
 }
 
-/// The count noun and `before → after` phrase for a `(base, head)` section.
-/// Exhaustive over all 36 pairs — no catch-all — so adding a [`State`] forces
-/// every new pair to be described deliberately. Section *order* is computed from
-/// state goodness, separately; see [`priority`].
-fn describe(base: State, head: State) -> (&'static str, &'static str) {
-    use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
-    // Nouns are singular count-nouns (pluralized with a trailing "s" by the
-    // renderer), so the phrase, not the noun, carries the before→after detail.
-    // "Skipped" (meta-blocked: broken/unsupported/insecure) is nixpkgs-review's
-    // term; rows failing/building *from* Skipped are only reachable via --no-skip.
-    match (base, head) {
-        (Built, Failed) => ("regression", "build on the base, fail here"),
-        (Built, Blocked) => (
-            "blocked package",
-            "build on the base, a dependency fails here",
-        ),
-        (Absent, Failed) => ("new failure", "added here, fail to build"),
-        (Absent, Blocked) => (
-            "new blocked package",
-            "added here, blocked by a failed dependency",
-        ),
-        (Unknown, Failed) => ("failure", "fail here; base status unknown"),
-        (Unknown, Blocked) => ("blocked package", "blocked here; base status unknown"),
-        (Skipped, Failed) => ("failure", "skipped on the base, fail here"),
-        (Skipped, Blocked) => (
-            "blocked package",
-            "skipped on the base, a dependency fails here",
-        ),
-        (Failed, Failed) => ("pre-existing failure", "fail on the base and here"),
-        (Failed, Blocked) => ("pre-existing failure", "fail on the base, blocked here"),
-        (Blocked, Failed) => ("pre-existing failure", "blocked on the base, fail here"),
-        (Blocked, Blocked) => (
-            "pre-existing blocked package",
-            "blocked on the base and here",
-        ),
-        (Built, Skipped) => (
-            "newly skipped package",
-            "build on the base, skipped here (not attempted)",
-        ),
-        (Failed, Skipped) => (
-            "newly skipped package",
-            "fail on the base, skipped here (not attempted)",
-        ),
-        (Blocked, Skipped) => (
-            "newly skipped package",
-            "blocked on the base, skipped here (not attempted)",
-        ),
-        (Absent, Skipped) => (
-            "new skipped package",
-            "added here, already skipped (not attempted)",
-        ),
-        (Unknown, Skipped) => (
-            "skipped package",
-            "skipped here (not attempted); base status unknown",
-        ),
-        (Skipped, Skipped) => (
-            "pre-existing skipped package",
-            "skipped on the base and here (not attempted)",
-        ),
-        (Built, Absent) => ("dropped package", "build on the base, gone here"),
-        (Failed, Absent) => ("removed package", "failed on the base, gone here"),
-        (Blocked, Absent) => ("removed package", "blocked on the base, gone here"),
-        (Skipped, Absent) => ("removed skipped package", "skipped on the base, gone here"),
-        (Failed, Built) => ("fixed package", "fail on the base, build here"),
-        (Blocked, Built) => ("fixed package", "blocked on the base, build here"),
-        (Skipped, Built) => ("newly enabled package", "skipped on the base, build here"),
-        (Absent, Built) => ("new package", "new here, build"),
-        (Unknown, Built) => ("built package", "build here; base status unknown"),
-        (Built, Built) => ("unchanged package", "build on the base and here"),
-        // A head-side Unknown means the build phase left this drv unrecorded
-        // (§5's accepted gap): the drv exists but has no fact yet.
-        (Built, Unknown) => ("unbuilt package", "build on the base; no fact here yet"),
-        (Failed, Unknown) => ("unbuilt package", "fail on the base; no fact here yet"),
-        (Blocked, Unknown) => ("unbuilt package", "blocked on the base; no fact here yet"),
-        (Skipped, Unknown) => ("unbuilt package", "skipped on the base; no fact here yet"),
-        (Absent, Unknown) => ("new unbuilt package", "added here; no fact yet"),
-        (Unknown, Unknown) => ("unbuilt package", "no facts on either side yet"),
-        (Unknown, Absent) => ("removed package", "gone here; base status unknown"),
-        // Not producible by the diff (a changed row has a drv on at least one
-        // side), but the renderer shouldn't panic if it ever appears.
-        (Absent, Absent) => ("package", "absent on both sides"),
-    }
-}
-
 /// Render one section: its `before → after` header, then one bullet per group
 /// of attrs sharing a derivation (`a = b = c`, shortest attr first).
 fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
@@ -217,11 +155,11 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     let groups = by_drv.len();
     let attrs_total = entries.len();
 
-    let (noun, phrase) = describe(base, head);
-    let plural = if groups == 1 { "" } else { "s" };
-    // Note the raw attr count too, but only when grouping actually collapsed rows.
+    // The bold count is the attr total; pluralize by it.
+    let plural = if attrs_total == 1 { "" } else { "s" };
+    // Note the distinct-derivation count too, but only when grouping collapsed rows.
     let note = if attrs_total != groups {
-        format!(" ({attrs_total} attrs)")
+        format!(" ({groups} unique)")
     } else {
         String::new()
     };
@@ -229,7 +167,7 @@ fn render_section(base: State, head: State, entries: &[&Entry]) -> String {
     // Sections carry their own separator *before* them (a leading blank line),
     // so the gaps fall between sections and none trails the last one.
     let mut s = format!(
-        "\n<details><summary>{} → {} · <b>{groups} {noun}{plural}</b>{note} — {phrase}</summary>\n\n",
+        "\n<details><summary>{} → {} · <b>{attrs_total} package{plural}</b>{note}</summary>\n\n",
         base.glyph(),
         head.glyph(),
     );
@@ -265,8 +203,8 @@ fn longest_backtick_run(s: &str) -> usize {
 
 /// Render the per-system entries to Markdown, grouped into `before → after`
 /// sections ordered worst-delta-first. `command` is the shell reproduction of
-/// this exact changeset (see `repro_command`), printed as a copy-pasteable code
-/// block right under the heading (DESIGN §8).
+/// this exact changeset (see `repro_command`), tucked under the heading inside a
+/// folded <details> alongside a legend of the glyphs (DESIGN §8).
 pub fn render(
     base: &str,
     head: &str,
@@ -280,7 +218,17 @@ pub fn render(
     // Bare commit hashes (no code span) so GitHub auto-links them as short SHAs.
     // `npd` links to the exact source tree this binary was built from (§8).
     let url = crate::URL;
-    let mut out = format!("## [`npd`]({url}) · {base} → {head}\n\n{fence}sh\n{command}\n{fence}\n");
+    let mut out = format!("## [`npd`]({url}) · {base} → {head}\n\n");
+    // The reproduction command and the glyph legend each fold away behind a
+    // <details>, keeping the heading close to the per-system sections below.
+    out.push_str("<details><summary>Expand this for a reproducible command.</summary>\n\n");
+    out.push_str(&format!("{fence}sh\n{command}\n{fence}\n"));
+    out.push_str("</details>\n\n");
+    out.push_str("<details><summary>Expand this for a legend of all symbols below.</summary>\n\n");
+    for state in State::ALL {
+        out.push_str(&format!("- {} = {}\n", state.glyph(), state.label()));
+    }
+    out.push_str("</details>\n");
     for (system, entries) in per_system {
         out.push_str(&format!("\n### `{system}`\n"));
         if entries.is_empty() {
@@ -369,7 +317,8 @@ mod tests {
         let cmd = "git apply --cached <<'PATCH'\n+```sh hi\nPATCH";
         let out = render("b", "h", cmd, &[]);
         assert!(out.contains("\n````sh\n"), "{out}");
-        assert!(out.ends_with("\n````\n"), "{out}");
+        // The block closes on its own oversized fence, then the <details> wrapping it.
+        assert!(out.contains("\n````\n</details>\n"), "{out}");
         // The common (no-backtick) command still gets a plain triple fence.
         let out = render("b", "h", "npd --base a --head b", &[]);
         assert!(out.contains("\n```sh\n"), "{out}");
@@ -378,23 +327,20 @@ mod tests {
     #[test]
     fn priority_orders_worst_delta_first() {
         use State::{Absent, Blocked, Built, Failed, Skipped, Unknown};
-        const ALL: [State; 6] = [Built, Failed, Blocked, Skipped, Absent, Unknown];
-        let mut pairs: Vec<(State, State)> = ALL
+        let mut pairs: Vec<(State, State)> = State::ALL
             .iter()
-            .flat_map(|&b| ALL.iter().map(move |&h| (b, h)))
+            .flat_map(|&b| State::ALL.iter().map(move |&h| (b, h)))
             .collect();
 
         // The full sort key (priority + the (base, head) tie-break render uses)
         // is a total order: every pair gets a distinct slot, so section order is
-        // deterministic. Every pair also has a real noun and phrase.
+        // deterministic.
         let mut seen = std::collections::HashSet::new();
         for &(b, h) in &pairs {
             assert!(
                 seen.insert((priority(b, h), b, h)),
                 "duplicate slot {b:?}→{h:?}"
             );
-            let (noun, phrase) = describe(b, h);
-            assert!(!noun.is_empty() && !phrase.is_empty());
         }
         assert_eq!(seen.len(), 36);
 
@@ -488,23 +434,34 @@ mod tests {
             &[("aarch64-linux".into(), entries)],
         );
 
-        // The reproduction command sits in a code block right under the heading.
+        // The reproduction command sits in a code block behind a folded <details>.
         assert!(
-            out.contains("\n\n```sh\nnpd --base base --head head\n```\n"),
+            out.contains(
+                "<details><summary>Expand this for a reproducible command.</summary>\n\n\
+                 ```sh\nnpd --base base --head head\n```\n</details>\n"
+            ),
             "{out}"
         );
+        // The glyph legend is a second folded <details>, one bullet per state.
+        assert!(
+            out.contains(
+                "<details><summary>Expand this for a legend of all symbols below.</summary>"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("- ✅ = successfully built\n"), "{out}");
+        assert!(out.contains("- ❔ = couldn't try to build\n"), "{out}");
 
-        // Composable tokens and the transitive distinction.
-        assert!(out.contains("✅ → ❌ · <b>1 regression</b>"), "{out}");
-        assert!(out.contains("✅ → 🚫 · <b>2 blocked packages</b>"), "{out}");
-        assert!(
-            out.contains("✅ → ⏩ · <b>1 newly skipped package</b>"),
-            "{out}"
-        );
+        // Composable glyph tokens with a plain package count; the transitive
+        // distinction shows through 🚫.
+        assert!(out.contains("✅ → ❌ · <b>1 package</b>"), "{out}");
+        assert!(out.contains("✅ → 🚫 · <b>2 packages</b>"), "{out}");
+        assert!(out.contains("✅ → ⏩ · <b>1 package</b>"), "{out}");
         // Grouping: shared drv collapses to one equals-joined line, shortest first.
         assert!(out.contains("- `foo` = `z.foo`"), "{out}");
+        // Two attrs, one derivation: the total counts, the distinct count notes.
         assert!(
-            out.contains("✅ → ✅ · <b>1 unchanged package</b> (2 attrs)"),
+            out.contains("✅ → ✅ · <b>2 packages</b> (1 unique)"),
             "{out}"
         );
         // All sections are folded closed.

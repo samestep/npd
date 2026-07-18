@@ -15,18 +15,31 @@ That command may not give you the same result if you run it yourself, but `npd`'
 
 > ## [`npd`](README.md) · [`dce745c`](https://github.com/NixOS/nixpkgs/commit/dce745ce155ce35a8121ee7280e7ae53559cead3) → [`5f96e8f`](https://github.com/NixOS/nixpkgs/commit/5f96e8fa57f8703504fe54b642bfcb4264aa9d4d)
 >
+> <details><summary>Expand this for a reproducible command.</summary>
+>
 > ```sh
 > npd --base dce745ce155ce35a8121ee7280e7ae53559cead3 --head 840dbf16cf78ddd86383d55a3beefa44df86cfd9 --patch 840dbf16cf78ddd86383d55a3beefa44df86cfd9...5f96e8fa57f8703504fe54b642bfcb4264aa9d4d -s x86_64-linux
 > ```
+> </details>
+>
+> <details><summary>Expand this for a legend of all symbols below.</summary>
+>
+> - ✅ = successfully built
+> - ❌ = failed to build
+> - 🚫 = dependency failed to build
+> - ⏩ = didn't try to build
+> - ➖ = doesn't exist
+> - ❔ = couldn't try to build
+> </details>
 >
 > ### `x86_64-linux`
 >
-> <details><summary>✅ → ❌ · <b>1 regression</b> — build on the base, fail here</summary>
+> <details><summary>✅ → ❌ · <b>1 package</b></summary>
 >
 > - `coqPackages.graph-theory`
 > </details>
 >
-> <details><summary>✅ → 🚫 · <b>5 blocked packages</b> (8 attrs) — build on the base, a dependency fails here</summary>
+> <details><summary>✅ → 🚫 · <b>8 packages</b> (5 unique)</summary>
 >
 > - `coqPackages.mathcomp-analysis-stdlib` = `rocqPackages.mathcomp-analysis-stdlib`
 > - `coqPackages.mathcomp-analysis` = `rocqPackages.mathcomp-analysis`
@@ -35,12 +48,12 @@ That command may not give you the same result if you run it yourself, but `npd`'
 > - `coqPackages.ssprove`
 > </details>
 >
-> <details><summary>✅ → ➖ · <b>1 dropped package</b> — build on the base, gone here</summary>
+> <details><summary>✅ → ➖ · <b>1 package</b></summary>
 >
 > - `rocqPackages.mathcomp-real-closed`
 > </details>
 >
-> <details><summary>✅ → ✅ · <b>13 unchanged packages</b> (17 attrs) — build on the base and here</summary>
+> <details><summary>✅ → ✅ · <b>17 packages</b> (13 unique)</summary>
 >
 > - `coqPackages.coqeal`
 > - `coqPackages.fourcolor`

@@ -680,9 +680,10 @@ The heading links `npd` to the exact source tree the binary was built from —
 `main` for a dirty tree). `--version` prints the same URL, so a report and the
 binary that produced it point at one commit. This is npc's `--version` scheme.
 
-**Every report opens with a copy-pasteable reproduction command** (a ```sh```
-block right under the heading, `repro_command` in `src/main.rs`) so anyone can
-re-run `npd` on the *exact same changeset* — not the ambiguous invocation the
+**Every report carries a copy-pasteable reproduction command** (a ```sh```
+block folded in a `<details>` under the heading, `repro_command` in
+`src/main.rs`), followed by a second `<details>` glossing every glyph, so anyone
+can re-run `npd` on the *exact same changeset* — not the ambiguous invocation the
 author happened to type (`npd` alone means a different changeset per machine and
 day), but the resolved identity. Every form runs `npd --base <sha> --head <…>`
 on a **pinned base** and a head whose **tree** is pinned: because the eval is
