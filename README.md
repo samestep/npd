@@ -80,6 +80,19 @@ That command may not give you the same result if you run it yourself, but `npd`'
 - [Installation](#installation)
   - [Temporary](#temporary)
 - [Usage](#usage)
+  - [`-h`, `--help`](#-h---help)
+  - [`-C`](#-c)
+  - [`--base`](#--base)
+  - [`--head`](#--head)
+  - [`--pr`](#--pr)
+  - [`--patch`](#--patch)
+  - [`--no-merge`](#--no-merge)
+  - [`--no-tests`](#--no-tests)
+  - [`--no-skip`](#--no-skip)
+  - [`--retry`](#--retry)
+  - [`-s`, `--system`](#-s---system)
+  - [`--clean`](#--clean)
+  - [`-V`, `--version`](#-v---version)
 - [Acknowledgments](#acknowledgments)
 
 <!-- tocstop -->
@@ -123,8 +136,70 @@ This starts a shell within your shell which has `npd` available on the `PATH`.
 
 ## Usage
 
+### `-h`, `--help`
+
+To list available CLi arguments:
+
 ```sh
 npd --help
+```
+
+### `-C`
+
+By default, `npd` assumes the current working directory is a clone of the Nixpkgs repo. If your Nixpkgs clone is somewhere else:
+
+```sh
+npd -C ~/github/NixOS/nixpkgs
+```
+
+Note that, just like [Git's `-C`](https://git-scm.com/docs/git#Documentation/git.txt--Cpath), this argument affects how other paths are interpreted, specifically for `--patch`.
+
+### `--base`
+
+By default, `npd` compares against `master`. To compare against a different base:
+
+```sh
+npd --base release-26.05
+```
+
+### `--head`
+
+By default, `npd` evaluates on the current working tree. To evaluate on a different revision:
+
+```sh
+npd --head some-branch
+```
+
+### `--pr`
+
+To set `--base` and `--head` from the current state of an open pull request:
+
+```sh
+npd --pr 543008
+```
+
+Note that this is an exception to `npd`'s usual rule that a re-run should be fully cached. If you run `npd` with a `--pr` argument, then that PR is updated, and you run the same `npd` command again, it will fetch the current state of the PR every time.
+
+### `--patch`
+
+### `--no-merge`
+
+### `--no-tests`
+
+### `--no-skip`
+
+### `--retry`
+
+### `-s`, `--system`
+
+### `--clean`
+
+### `-V`, `--version`
+
+Print the version:
+
+```sh
+npd --version
 ```
 
 ## Acknowledgments
