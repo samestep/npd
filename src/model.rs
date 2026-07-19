@@ -35,7 +35,7 @@
 /// name) rather than a resolved sha — `master`, `HEAD`, a branch, `#431 base` —
 /// and, for a commit npd *derives*, an honest description of it: `merge(a, b)`
 /// for a synthetic merge, `merge-base(a, b)` for a `--no-merge` fork point,
-/// `HEAD *` for a working-tree/patch head. It describes the tree actually
+/// `HEAD*` for a working-tree/patch head. It describes the tree actually
 /// evaluated (DESIGN §6), so a sha appears only if the user typed one. Distinct
 /// from [`label`] precisely because `label` is a real committish the repro path
 /// feeds to `git`, and the report heading keeps showing it as a sha (GitHub

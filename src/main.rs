@@ -345,7 +345,7 @@ fn commit_source(repo: &std::path::Path, commit: String, display: String) -> Res
 /// ([`worktree_source`]). This is what lets `npd` review in-progress work;
 /// committing that work as-is later is a cache *hit*, since both resolve to the
 /// identical tree (see [`Rev`]). Its live-tree `display` is `HEAD` when clean and
-/// `HEAD *` when dirty (the same `*` marker the report and `--patch` use).
+/// `HEAD*` when dirty (the same `*` marker the report and `--patch` use).
 fn head_source(repo: &std::path::Path) -> Result<Rev> {
     let head = resolve_commit(repo, "HEAD")?;
     match worktree_source(repo, &head)? {
@@ -381,7 +381,7 @@ fn worktree_source(repo: &std::path::Path, head: &str) -> Result<Option<Rev>> {
         repo,
         tree_of(repo, &stash)?,
         head,
-        "HEAD *".into(),
+        "HEAD*".into(),
     )?))
 }
 
@@ -460,7 +460,7 @@ fn patch_source(
     let tree = git_env(repo, &env, &["write-tree"])?;
     // The patched head is `anchor` plus a diff, shown with the same `*` marker
     // the report and the working-tree capture use.
-    worktree_commit(repo, tree, &anchor, format!("{anchor_display} *"))
+    worktree_commit(repo, tree, &anchor, format!("{anchor_display}*"))
 }
 
 /// A path as a UTF-8 `&str`, or an error (paths npd makes are always UTF-8).
@@ -585,7 +585,7 @@ fn resolve_compare_head(
     literal: &str,
     tree: &live::Tree,
 ) -> Result<Rev> {
-    let display = format!("{} *", anchor.display);
+    let display = format!("{}*", anchor.display);
     if let Some(cached) = cache.patch_tree(&anchor.commit, expr)? {
         // Re-mint the synthetic head over the cached tree — succeeds iff its
         // objects are still in the repo (no network). If `git gc` reclaimed the
