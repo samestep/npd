@@ -355,28 +355,48 @@ lib.listToAttrs (map (name: lib.nameValuePair name (node name)) attrs)
 
 /// Evaluate the `passthru.tests` of several `(commit, system, packages)`
 /// requests **together**, through one shard scheduler — one shared queue,
-/// cross-eval load balancing — after all eval finishes. `nodes` are the `tests`
+/// cross-key load balancing — after all eval finishes. `nodes` are the `tests`
 /// leaves the caller already created per-system as each platform's eval landed
 /// (parallel to `requests`; DESIGN §9), which this drives to running/done.
 /// Returns the resolved [`TestJob`]s per request, parallel to `requests` (one
 /// `<pkg>.tests.<name>` per job). Callers pass only the packages not already
 /// cached (see `main`); an empty/all-empty `requests` does no work.
+///
+/// **The scheduling atom is the `(commit, system)` key — one shard per request,
+/// never sub-sliced — exactly like [`instantiate_execute`] and for the same
+/// reason (DESIGN §6).** Both phases share the cost structure: the dominant cost
+/// is the per-key nixpkgs-spine re-import, and the changed set is only a handful
+/// of packages, so splitting a key's packages across shards would just re-pay
+/// that import per shard while multiplying the concurrent heavy workers. And here
+/// each worker is *heavy* — a `nixosTest` ≈ a whole NixOS system — so that
+/// oversubscribes RAM: the old `total/(2·slots)` sub-slicing started
+/// `2·slots` workers and cascaded into OOM, then requeued a fat shard forever
+/// once slots bottomed out at 1 (the shard, not the concurrency, was the
+/// memory-bearing unit AIMD couldn't shrink). With the key as the atom, backing
+/// off the slot count directly backs off concurrent heavy workers — real memory
+/// control — and each key's single worker recycles its heap per package at the
+/// restart cap. Concurrency is across keys (only ~2 per system), started at the
+/// heavy-worker budget ([`TESTS_SLOT_MEM_MB`]) and honoring `--eval-slots`.
 pub fn eval_tests(
     repo: &Path,
     requests: &[(Rev, String, Vec<String>)],
     nodes: Vec<Arc<live::Node>>,
+    opts: EvalOpts,
     handle: live::LiveHandle<'_>,
 ) -> Result<Vec<Vec<TestJob>>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-    let slots = default_slots(None);
-    // Slice every request's packages into ~2×`slots` shards total, so the pool
-    // stays full and balances across requests (a nixosTest ≈ a whole NixOS
-    // system, so the AIMD backoff earns its keep). ~2×slots keeps the nixpkgs
-    // spine re-imported no more than the old one-request-at-a-time eval did.
-    let total: usize = requests.iter().map(|(_, _, p)| p.len()).sum();
-    let shard_size = total.div_ceil(slots * 2).max(1);
+    let slots = default_slots(TESTS_SLOT_MEM_MB, opts.slots);
+    let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
+    // One shard per key: sizing at the largest request makes every group exactly
+    // one shard (no split), so each key re-imports nixpkgs just once.
+    let shard_size = requests
+        .iter()
+        .map(|(_, _, p)| p.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     // The `tests` leaves were created per-system as each platform's eval landed
     // (DESIGN §9), so `nodes` is parallel to `requests`; execution is still one
@@ -407,7 +427,7 @@ pub fn eval_tests(
             stream_jobs(
                 &expr,
                 1,
-                DEFAULT_WORKER_MEM_MB,
+                per_worker_mb,
                 false,
                 label,
                 raw_to_test_job,
@@ -441,6 +461,15 @@ const DEFAULT_WORKER_MEM_MB: u64 = 4096;
 /// workers when it had 18 cores); ~2 GiB matches the measured best worker counts
 /// across 62/31/16 GiB machines, and AIMD backs off if a run overshoots RAM.
 const SLOT_MEM_MB: u64 = 2048;
+
+/// Per-slot RAM budget for the `--tests` eval, distinct from [`SLOT_MEM_MB`]
+/// because a `passthru.tests` worker is far heavier: each `nixosTest` pulls in a
+/// whole NixOS system, so its worker genuinely approaches the [`DEFAULT_WORKER_MEM_MB`]
+/// restart cap rather than sitting well under it like a full-set worker. Counting
+/// a tests slot at the *typical* full-set footprint (2 GiB) is what started 15
+/// heavy workers on a 31 GiB box and cascaded into OOM; budgeting at the cap
+/// starts a memory-safe count (~7 on that box) and AIMD trims from there.
+const TESTS_SLOT_MEM_MB: u64 = DEFAULT_WORKER_MEM_MB;
 
 /// Top-level attr names per shard. Larger shards amortize the per-job nixpkgs
 /// import (a few seconds each); smaller ones requeue more cheaply and balance
@@ -562,13 +591,16 @@ fn eval_slots(cores: usize, mem_mb: u64, per_slot_mb: u64, user: Option<u64>) ->
 }
 
 /// [`eval_slots`] wired to this machine's invariants — the starting slot count
-/// every scheduler run uses (the user's `--eval-slots` when set, else auto).
-/// `eval_slots` stays a standalone pure fn so its unit test can pin the arithmetic.
-fn default_slots(user: Option<u64>) -> usize {
+/// every scheduler run uses (the user's `--eval-slots` when set, else auto from
+/// cores and RAM divided by `per_slot_mb`). Callers pass the per-slot budget for
+/// their workload: [`SLOT_MEM_MB`] for the light full-set/instantiate workers,
+/// [`TESTS_SLOT_MEM_MB`] for the heavy `--tests` workers. `eval_slots` stays a
+/// standalone pure fn so its unit test can pin the arithmetic.
+fn default_slots(per_slot_mb: u64, user: Option<u64>) -> usize {
     let cores = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    eval_slots(cores, total_mem_mb(), SLOT_MEM_MB, user)
+    eval_slots(cores, total_mem_mb(), per_slot_mb, user)
 }
 
 /// What a phase's commit leaves show in the number column: nothing (a state
@@ -732,7 +764,7 @@ pub fn instantiate_execute(
     handle: live::LiveHandle<'_>,
 ) -> Result<()> {
     let Instantiate { requests, nodes } = inst;
-    let slots = default_slots(None);
+    let slots = default_slots(SLOT_MEM_MB, None);
     let labels: Vec<String> = requests
         .iter()
         .map(|(rev, system, _)| format!("{} {system}", rev.display))
@@ -1025,7 +1057,7 @@ pub fn eval_pairs(
     let per_worker_mb = opts.worker_mem_mb.unwrap_or(DEFAULT_WORKER_MEM_MB);
     // Count slots at the ~2 GiB typical footprint, but each worker keeps the
     // 4 GiB restart cap (`per_worker_mb`) — the two are deliberately decoupled.
-    let slots = default_slots(opts.slots);
+    let slots = default_slots(SLOT_MEM_MB, opts.slots);
 
     // One shard group per `(tree, system)` for both phases below; `meta` keeps
     // the identifying `(rev, system)` per group (the rev supplies fetchGit's

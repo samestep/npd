@@ -1054,7 +1054,7 @@ fn run_phases(
     // scheduler pass, cache the results, then fold each system's test rows into
     // its changed set — classified (regression / fixed / new / …) like any attr.
     if tests {
-        let jobs_per = eval::eval_tests(repo, &requests, nodes, handle)?;
+        let jobs_per = eval::eval_tests(repo, &requests, nodes, opts, handle)?;
         let mut acc = accum.lock().unwrap();
         for ((rev, sys, misses), jobs) in requests.iter().zip(&jobs_per) {
             acc.store.cache_test_eval(&rev.tree, sys, misses, jobs)?;

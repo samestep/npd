@@ -648,8 +648,23 @@ full-set eval** (`run_shards` in `src/eval.rs`). The misses across *every*
 `(commit, system)` in the review are gathered and evaluated in **one** scheduler
 run — a group per key, all shown and load-balanced together (just as the full
 eval hands all its `(commit, system)` pairs to one queue), rather than one
-key at a time — sliced into ~2×`eval-slots` shards so the pool stays full (a
-`nixosTest` ≈ a whole NixOS system, so the AIMD memory backoff matters). It gets
+key at a time. But — like the instantiate phase and *unlike* the full-set eval —
+**the scheduling atom is the whole `(commit, system)` key: one shard per key,
+never sub-sliced.** Both phases share the full eval's *machinery* but not its
+work shape: their dominant cost is the per-key nixpkgs-spine re-import over a
+changed set of a handful of packages, so slicing a key's packages across shards
+would only re-pay that import per shard for no gain. For `--tests` there is a
+second, sharper reason: a `nixosTest` worker ≈ a whole NixOS system, so it is the
+*heaviest* fan-out npd runs, and sub-slicing multiplied the concurrent heavy
+workers — the earlier `total/(2·slots)` split started `2·slots` of them and
+cascaded into OOM, then requeued one fat shard forever once the slot count
+bottomed out at 1, because the shard (not the concurrency) was the
+memory-bearing unit AIMD could never shrink. With the key as the atom, backing
+off the slot count backs off concurrent heavy workers directly — real memory
+control — the starting count is budgeted at the heavy-worker footprint
+(`TESTS_SLOT_MEM_MB`, the worker restart cap, not the full-set eval's lighter
+per-slot figure) and honors `--eval-slots`, and each key's single worker recycles
+its heap per package at that cap. It gets
 the identical `done + running / total` display. Sharing the scheduler means its
 concurrency logic is exercised — and kept correct — by **every** memory-heavy
 `nix-eval-jobs` fan-out (enumeration, the full-set eval, `--tests`, and
