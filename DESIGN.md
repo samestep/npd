@@ -167,7 +167,7 @@ a package, append new ones), not a bulk write-once map to diff — so it wants t
 engine, not a file. Two space measures keep it lean, since it dominates the
 database file: the `(tree, system)` a row belongs to is **interned** into an
 `eval_key` table and referenced by a small integer id rather than repeated as a
-40-char tree hash on every row of both the table and its index (the bulk of the
+40-char tree hash on every row (the bulk of the
 win — a handful of keys back thousands of rows); and drv paths are stored
 **stripped** of their constant `/nix/store/…​.drv` affixes, exactly like the eval
 files (`evalfile::strip_drv`), restored on read. Every query is already scoped to

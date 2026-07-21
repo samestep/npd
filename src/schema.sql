@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS observation_drv ON observation (drv_path);
 --
 -- The `(tree, system)` an eval belongs to is *interned* into `eval_key` and
 -- referenced by its small integer `id`, rather than repeated as a 40-char tree
--- hash + system string on every row of both the table and its index. A handful
+-- hash + system string on every row of the tables below. A handful
 -- of distinct keys back thousands of test rows, so this is ~25% off the whole
 -- `--tests` cache on real data (the biggest lever; DESIGN.md §4). It's also the
 -- eviction unit: dropping an eval file (`--clean`) purges its key here, cascading
@@ -64,15 +64,19 @@ CREATE TABLE IF NOT EXISTS test_pkg (
     pkg_attr TEXT NOT NULL,
     PRIMARY KEY (key_id, pkg_attr)
 ) STRICT, WITHOUT ROWID;
+-- The primary key includes `pkg_attr` (though `test_attr` alone would be unique
+-- per key — it's the full `<pkg>.tests.<name>` path, embedding the package) so
+-- the one read pattern, `WHERE key_id = ? AND pkg_attr IN (…)`, is a prefix scan
+-- of the WITHOUT-ROWID clustering key itself — no secondary index, which would
+-- otherwise store every column a second time.
 CREATE TABLE IF NOT EXISTS test_drv (
     key_id    INTEGER NOT NULL REFERENCES eval_key (id),
     pkg_attr  TEXT NOT NULL,
     test_attr TEXT NOT NULL,
     drv_path  TEXT NOT NULL,
     skipped   INTEGER NOT NULL,
-    PRIMARY KEY (key_id, test_attr)
+    PRIMARY KEY (key_id, pkg_attr, test_attr)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS test_drv_pkg ON test_drv (key_id, pkg_attr);
 
 -- The patch-tree cache (DESIGN.md §8): maps a `--patch <A...B>` compare — its
 -- anchor commit and sha-pinned expression — to the head *tree* npd reconstructed
