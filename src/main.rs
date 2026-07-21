@@ -1293,12 +1293,18 @@ fn run(cli: Cli) -> Result<()> {
                 Some(d) => store.load_observations(d)?,
                 None => Vec::new(),
             };
+            // The *effective* skipped bit: under --no-skip a meta-blocked
+            // package is built like any other and reports its real outcome;
+            // without the flag the marking masks any recorded fact (⏩), so a
+            // default run's report is stable regardless of what earlier
+            // --no-skip runs learned.
+            let mask = |skipped: bool| skipped && !policy.no_skip;
             entries.push(report::Entry {
                 attr: c.attr.clone(),
                 base_drv: c.base_drv.clone(),
                 head_drv: c.head_drv.clone(),
-                base: report::side_state(&c.base_drv, c.base_skipped, &base_obs),
-                head: report::side_state(&c.head_drv, c.head_skipped, &head_obs),
+                base: report::side_state(&c.base_drv, mask(c.base_skipped), &base_obs),
+                head: report::side_state(&c.head_drv, mask(c.head_skipped), &head_obs),
             });
         }
         per_system.push((sys.clone(), entries));

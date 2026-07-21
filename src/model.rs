@@ -191,15 +191,12 @@ impl BuildPolicy {
         let dep_failed = observations.iter().any(|o| o.outcome == Outcome::DepFailed);
 
         // Meta-blocked and not overridden: never attempt (checked before the
-        // other knobs, so e.g. `--retry` alone still doesn't build it). A real
-        // fact recorded earlier (a prior `--no-skip` run, or cache presence)
-        // still counts.
+        // other knobs, so e.g. `--retry` alone still doesn't build it), and
+        // never anything but `Skipped` — the marking masks recorded facts, so a
+        // default run behaves identically whatever earlier `--no-skip` runs
+        // learned (the report masks the same way; `report::side_state`).
         if skipped && !self.no_skip {
-            return if built {
-                Decision::SkipOk
-            } else {
-                Decision::Skipped
-            };
+            return Decision::Skipped;
         }
         // A trusted success short-circuits.
         if built {
@@ -321,10 +318,11 @@ mod tests {
             Decision::Skipped
         );
 
-        // A recorded success — a prior --no-skip run's build, or cache
-        // presence — is still a trusted fact and outranks the marking.
+        // The marking masks recorded facts: even a drv an earlier --no-skip run
+        // built (or found in the cache) stays Skipped on a default run, so its
+        // behavior doesn't depend on what past runs happened to learn.
         let o = [obs(Outcome::Built)];
-        assert_eq!(p.decide(&o, true, false), Decision::SkipOk);
+        assert_eq!(p.decide(&o, true, false), Decision::Skipped);
 
         // --no-skip restores the normal policy.
         let ns = BuildPolicy {

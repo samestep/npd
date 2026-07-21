@@ -23,8 +23,10 @@ pub enum State {
     Blocked,
     /// Meta-blocked (broken/unsupported/insecure) — not attempted by default,
     /// nixpkgs-review's "skipped" (its meta-blocked subset; a *missing* attr is
-    /// `Absent`, not this). `--no-skip` builds it anyway, and any real build
-    /// fact then outranks this state.
+    /// `Absent`, not this). `--no-skip` builds it anyway and reports the real
+    /// outcome; without the flag the marking *masks* any recorded fact, so a
+    /// default run's report doesn't depend on what earlier `--no-skip` runs
+    /// happened to learn.
     Skipped,
     /// Has a derivation but no build fact yet. Builds always run, so this is
     /// only the build phase's accepted gap (§5): a target nix never reached,
@@ -88,27 +90,31 @@ impl State {
     }
 }
 
-/// Reduce a side (its optional drv + meta-blocked bit + that drv's
+/// Reduce a side (its optional drv + *effective* meta-blocked bit + that drv's
 /// observations) to a state.
 ///
-/// A success beats a failure (it *can* build — `flaky_success_wins`; a cache
-/// hit is recorded as the same `Built` fact, DESIGN §7). A direct failure
-/// outranks a dependency failure (it's the more specific fact about this drv).
-/// Being meta-blocked (`Skipped`) only shows when no build fact exists — a
-/// package built anyway (`--no-skip`) reports its real outcome.
+/// `skipped` masks everything but absence: a meta-blocked attr renders ⏩ even
+/// when the log holds a real fact for its drv (say, from an earlier `--no-skip`
+/// run), so a default run's report never depends on what past runs happened to
+/// learn. The caller gates the bit on the flag (`skipped && !no_skip`) — under
+/// `--no-skip` the package is built like any other and reports its real
+/// outcome. Below that, a success beats a failure (it *can* build —
+/// `flaky_success_wins`; a cache hit is recorded as the same `Built` fact,
+/// DESIGN §7), and a direct failure outranks a dependency failure (it's the
+/// more specific fact about this drv).
 pub fn side_state(drv: &Option<String>, skipped: bool, obs: &[Observation]) -> State {
     if drv.is_none() {
         return State::Absent;
     }
     let has = |out: Outcome| obs.iter().any(|o| o.outcome == out);
-    if has(Outcome::Built) {
+    if skipped {
+        State::Skipped
+    } else if has(Outcome::Built) {
         State::Built
     } else if has(Outcome::Failed) {
         State::Failed
     } else if has(Outcome::DepFailed) {
         State::Blocked
-    } else if skipped {
-        State::Skipped
     } else {
         State::Unknown
     }
@@ -283,11 +289,17 @@ mod tests {
         assert_eq!(side_state(&d, false, &[obs(Outcome::Built)]), State::Built);
         let s = side_state(&d, false, &[obs(Outcome::Built), obs(Outcome::Failed)]);
         assert_eq!(s, State::Built);
-        // Meta-blocked with no facts is Skipped; a real fact (a --no-skip
-        // run's build or failure) outranks the marking. No drv is still Absent.
+        // The effective meta-blocked bit masks recorded facts — a default run
+        // shows ⏩ even for a drv an earlier --no-skip run built or failed, so
+        // its report doesn't depend on what past runs learned. (Under --no-skip
+        // the caller passes skipped = false, exposing the real outcome.)
         assert_eq!(side_state(&d, true, &[]), State::Skipped);
-        assert_eq!(side_state(&d, true, &[obs(Outcome::Built)]), State::Built);
-        assert_eq!(side_state(&d, true, &[obs(Outcome::Failed)]), State::Failed);
+        assert_eq!(side_state(&d, true, &[obs(Outcome::Built)]), State::Skipped);
+        assert_eq!(
+            side_state(&d, true, &[obs(Outcome::Failed)]),
+            State::Skipped
+        );
+        // No drv is still Absent, even when meta-blocked.
         assert_eq!(side_state(&None, true, &[]), State::Absent);
     }
 

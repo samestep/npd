@@ -205,8 +205,10 @@ probe hit is recorded as a plain `Built`, §7):
 
 - meta-blocked (broken/unsupported/insecure), `--no-skip` off → **skipped**
   — never attempted, like nixpkgs-review; the report shows ⏩. (Checked first,
-  so `--retry` alone doesn't build it; a real fact recorded by an earlier
-  `--no-skip` run still wins.)
+  so `--retry` alone doesn't build it. The marking *masks* recorded facts, in
+  the predicate and the report alike: a default run shows ⏩ even for a drv an
+  earlier `--no-skip` run built or failed, so default-run output never depends
+  on what past `--no-skip` runs happened to learn.)
 - never observed, or forced → **build**
 - a recorded success exists — built here, or substitutable (§7) → **skip (ok)**
 - only failures observed, `--retry` off → **skip (fail)**
@@ -715,8 +717,9 @@ Markdown, grouped by the **delta** each attr underwent. Each side reduces to one
 of six states — `✅` built, `❌` failed (direct), `🚫` blocked (a dependency
 failed — the transitive/cascade case, kept distinct from a direct failure), `⏩`
 skipped (meta-blocked: broken/unsupported/insecure — not attempted by default,
-like nixpkgs-review; a real build fact from a `--no-skip` run outranks the
-marking; a *missing* attr is `➖` absent, not this), `➖`
+like nixpkgs-review; the marking masks any recorded fact unless `--no-skip` is
+on, so a default report is stable across `--no-skip` history; a *missing* attr
+is `➖` absent, not this), `➖`
 absent (no such attr on that side, or it no longer evaluates — a *known* fact,
 never a `?`; in a delta view an eval breakage is visible as disappearance, so
 there is no separate eval-error state), `❔` unbuilt
