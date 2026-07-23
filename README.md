@@ -291,7 +291,7 @@ npb -s x86_64-linux -s aarch64-linux -s aarch64-darwin
 
 ### `--clean`
 
-Whenever `npb` encounters a Git tree it hasn't seen before, it evaluates Nixpkgs on that tree and saves the result to disk, roughly 3 megabytes each. To free up disk space by deleting the least recently used evaluation results:
+Whenever `npb` encounters a Git tree it hasn't seen before, it evaluates Nixpkgs on that tree and saves the result to disk, roughly 3 megabytes per tree per `--system`. To free up disk space by deleting the least recently used evaluation results:
 
 ```sh
 npb --clean 100MB
