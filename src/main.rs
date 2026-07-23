@@ -174,7 +174,8 @@ fn git_merge_base(repo: &std::path::Path, base: &str, head: &str) -> Result<Stri
 /// Fetch `ref_name` from `upstream` into `repo`'s ref of the same name,
 /// force-updating it (the `+` refspec) so a moved PR ref is picked up. Returns
 /// `Ok(true)` if it now exists, `Ok(false)` if `upstream` has no such ref (a
-/// conflicted PR publishes no `merge` ref), and `Err` on any other failure —
+/// merged or closed PR has no `merge` ref — GitHub keeps it only while a PR is
+/// open, even when it conflicts), and `Err` on any other failure —
 /// including an unreachable network, which a `--pr` run treats as fatal rather
 /// than silently reviewing a stale snapshot.
 fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<bool> {
@@ -209,10 +210,13 @@ fn fetch_ref(repo: &std::path::Path, upstream: &str, ref_name: &str) -> Result<b
 /// The default (merge) shape reuses GitHub's `merge` commit verbatim — it *is*
 /// the head merged onto the base — so there's no local merge, and the diff is
 /// exactly what ofborg/Hydra evaluate. `--no-merge` diffs from the merge-base of
-/// `merge^1` and the PR head (the PR's fork point on its real base branch). A
-/// conflicted PR has no `merge` ref: the merge shape then fails with a message
-/// pointing at `--no-merge`, and `--no-merge` falls back to the fork point with
-/// `master` (the only base we can name without the merge commit).
+/// `merge^1` and the PR head (the PR's fork point on its real base branch).
+/// GitHub keeps the `merge` ref only while a PR is open — even a conflicting
+/// open PR keeps a (stale) one — so a *missing* `merge` ref means the PR is
+/// already merged or closed, not that it conflicts. The merge shape then fails
+/// with a message pointing at `--no-merge`, and `--no-merge` falls back to the
+/// fork point with `master` (the only base we can name without the merge
+/// commit).
 fn resolve_pr(
     repo: &std::path::Path,
     upstream: &str,
@@ -226,8 +230,8 @@ fn resolve_pr(
     if no_merge {
         // Fork-point shape: merge-base(base-branch tip, PR head) → PR head. With
         // the merge commit we know the real base-branch tip (`merge^1`) and the
-        // PR head (`merge^2`); without it (a conflicted PR) we fall back to the
-        // PR head ref and `master`.
+        // PR head (`merge^2`); without it (a merged or closed PR) we fall back
+        // to the PR head ref and `master`.
         let (base_tip, head) = if have_merge {
             (
                 resolve_commit(repo, &format!("{merge_ref}^1"))?,
@@ -250,15 +254,21 @@ fn resolve_pr(
     }
 
     if !have_merge {
-        // No test-merge commit. Distinguish a conflicted PR from a missing one
-        // by whether the (always-published) head ref exists.
+        // No test-merge commit. GitHub keeps refs/pull/N/merge only while a PR
+        // is open — even a conflicting open PR keeps a stale one — so a missing
+        // merge ref almost always means the PR is already merged or closed, not
+        // that it conflicts. Tell that apart from a PR that never existed by the
+        // always-published head ref.
         let exists = fetch_ref(repo, upstream, &head_ref)?;
         if exists {
             bail!(
-                "PR #{pr} is not mergeable (it conflicts with its base branch), \
-                 so GitHub publishes no test-merge commit.\n\
-                 Re-run with `--pr {pr} --no-merge` to compare the PR head \
-                 against its fork point with master instead."
+                "PR #{pr} has no test-merge commit ({merge_ref}): GitHub keeps \
+                 that ref only while a PR is open — even a conflicting open PR \
+                 keeps it — so this almost always means PR #{pr} is already \
+                 merged or closed, not that it conflicts with its base.\n\
+                 If it really is still open, re-run with `--pr {pr} --no-merge` \
+                 to compare the PR head against its fork point with master \
+                 instead."
             );
         }
         bail!("PR #{pr} not found on {upstream}");
@@ -1539,7 +1549,7 @@ mod tests {
         let m = g(d, &["rev-parse", "HEAD"]);
         g(d, &["update-ref", "refs/pull/1/head", &c]);
         g(d, &["update-ref", "refs/pull/1/merge", &m]);
-        // PR #2: a head ref with no merge ref (models a conflicted PR).
+        // PR #2: a head ref with no merge ref (models a merged/closed PR).
         g(d, &["checkout", "-b", "pr2", &a]);
         g(d, &["commit", "--allow-empty", "-m", "D"]);
         let dsha = g(d, &["rev-parse", "HEAD"]);
@@ -1599,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pr_non_mergeable_errors_and_suggests_no_merge() {
+    fn resolve_pr_missing_merge_ref_errors_and_suggests_no_merge() {
         let (up, s) = pr_fixture();
         let local = tempfile::tempdir().unwrap();
         Proc::new("git")
@@ -1609,10 +1619,11 @@ mod tests {
             .status()
             .unwrap();
         let upstream = up.path().to_str().unwrap();
-        // No merge ref → the merge shape can't apply; a clear error → --no-merge.
+        // No merge ref (a merged/closed PR) → the merge shape can't apply; a
+        // clear error → --no-merge.
         let err = resolve_pr(local.path(), upstream, 2, false).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("not mergeable"), "{msg}");
+        assert!(msg.contains("no test-merge commit"), "{msg}");
         assert!(msg.contains("--no-merge"), "{msg}");
         // --no-merge falls back to the fork point with master: head = PR head
         // (D), base = merge-base(master = B, D) = A.

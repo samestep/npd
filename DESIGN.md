@@ -666,8 +666,10 @@ tip, head)` pair, npb reports one of two deltas:
   `base → head` at no extra eval; a distinct merged tree appears only under
   genuine base drift — precisely when you want to see it. A bonus: every review
   against the same base-branch tip shares its base eval (per-PR fork points never
-  did). A conflicted PR (no `merge` ref) or a conflicting local merge can't take
-  this path, so it fails with a message pointing at `--no-merge`.
+  did). A PR with no `merge` ref — GitHub keeps that ref only while a PR is open,
+  even when it conflicts, so its absence means the PR is merged or closed — or a
+  conflicting local merge can't take this path, so it fails with a message
+  pointing at `--no-merge`.
 
   > **Alternative considered, equally reasonable.** Keep reviewing GitHub's exact
   > test-merge (byte-identical to what CI built) and make the _repro_ reconstruct
@@ -694,7 +696,8 @@ tip, head)` pair, npb reports one of two deltas:
   drift since the fork point, and — in the default mode — it assumes `master`
   even for a change branched off a non-`master` base. For a PR it lands on the
   fork point with the PR's real target branch (`merge-base(merge^1, head)`), or,
-  if the PR is conflicted (no `merge` ref), the fork point with `master`.
+  if the PR has no `merge` ref (it is merged or closed), the fork point with
+  `master`.
 
 **Tests — the changed set's `passthru.tests`.** Ported from
 [nixpkgs-review#397](https://github.com/Mic92/nixpkgs-review/pull/397): for each
